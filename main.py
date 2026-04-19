@@ -1,4 +1,3 @@
-from os import path
 import sys
 from datetime import datetime, timedelta
 from astrbot.api.event import filter
@@ -8,8 +7,8 @@ import astrbot.api.message_components as Comp
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
-from astrbot.core.star.star_tools import StarTools
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+from astrbot.core.star.star_tools import StarTools
 from astrbot.core.star.filter.permission import PermissionType
 from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
 from .utils.text_to_image import text_to_image
@@ -20,19 +19,14 @@ from .core.normal import NormalHandle
 from .core.notice import NoticeHandle
 from .core.request import RequestHandle
 
-@register(
-    "astrbot_plugin_blacklist_tools",
-    "ctrlkk",
-    "允许管理员和 LLM 将用户添加到黑名单中，阻止他们的消息，自动拉黑！",
-    "1.6",
-)
+@register( "astrbot_plugin_blacklist_tools", "ctrlkk", "允许管理员和 LLM 将用户添加到黑名单中，阻止他们的消息，自动拉黑！", "1.6", )
 class MyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         
         # 黑名单工具初始化
         data_dir = StarTools.get_data_dir()
-        self.db_path = path.join(data_dir, "blacklist.db")
+        self.db_path = str(data_dir / "blacklist.db")
         # 黑名单最长时长
         self.max_blacklist_duration = config.get(
             "max_blacklist_duration", 1 * 24 * 60 * 60
@@ -55,6 +49,15 @@ class MyPlugin(Star):
         self.request = RequestHandle(self.cfg)
         self.notice = NoticeHandle(self.cfg)
         self.contact = ContactHandle(self.cfg)
+        
+        # 检查扩展功能是否可用
+        try:
+            from .core.expansion import ExpansionHandle
+            self.expansion_handle = ExpansionHandle
+            self.expansion_available = True
+        except ImportError:
+            self.expansion_handle = None
+            self.expansion_available = False
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
@@ -64,15 +67,8 @@ class MyPlugin(Star):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
         await self.db.terminate()
 
-    def _format_datetime(
-        self, iso_datetime_str, show_remaining=False, check_expire=False
-    ):
-        """统一格式化日期时间字符串
-        Args:
-            iso_datetime_str: ISO格式的日期时间字符串
-            show_remaining: 是否显示剩余时间
-            check_expire: 是否检查是否过期（仅对过期时间有效）
-        """
+    def _format_datetime( self, iso_datetime_str, show_remaining=False, check_expire=False ):
+        """统一格式化日期时间字符串 Args: iso_datetime_str: ISO格式的日期时间字符串 show_remaining: 是否显示剩余时间 check_expire: 是否检查是否过期（仅对过期时间有效） """
         if not iso_datetime_str:
             return "永久"
         try:
@@ -100,7 +96,7 @@ class MyPlugin(Star):
 
     # ==================== 黑名单功能 ====================
     
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=sys.maxsize - 1)
+@filter.event_message_type(filter.EventMessageType.ALL, priority=sys.maxsize - 1)
     async def on_all_message(self, event: AstrMessageEvent):
         """检查消息是否来自黑名单用户"""
         if not event.is_at_or_wake_command:
@@ -118,19 +114,15 @@ class MyPlugin(Star):
         except Exception as e:
             logger.error(f"检查黑名单时出错：{e}")
 
-    @filter.command_group("blacklist", alias=["black", "bl"])
+@filter.command_group("blacklist", alias=["black", "bl"])
     def blacklist():
         """黑名单管理命令组"""
         pass
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @blacklist.command("ls")
+@filter.permission_type(filter.PermissionType.ADMIN)
+@blacklist.command("ls")
     async def ls(self, event: AstrMessageEvent, page: int = 1, page_size: int = 10):
-        """列出黑名单中的所有用户（支持分页）
-        Args:
-            page: 页码，从1开始
-            page_size: 每页显示的数量
-        """
+        """列出黑名单中的所有用户（支持分页） Args: page: 页码，从1开始 page_size: 每页显示的数量 """
         try:
             total_count = await self.db.get_blacklist_count()
             if total_count == 0:
@@ -163,15 +155,10 @@ class MyPlugin(Star):
             logger.error(f"获取黑名单列表时出错：{e}")
             yield event.plain_result(f"获取黑名单列表失败: {str(e)}")
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @blacklist.command("add")
+@filter.permission_type(filter.PermissionType.ADMIN)
+@blacklist.command("add")
     async def add(self, event: AstrMessageEvent, user_id: str, duration: int = 0, reason: str = ""):
-        """添加用户到黑名单
-        Args:
-            user_id: 要添加的用户ID
-            duration: 黑名单时长（秒），0表示永久
-            reason: 拉黑原因
-        """
+        """添加用户到黑名单 Args: user_id: 要添加的用户ID duration: 黑名单时长（秒），0表示永久 reason: 拉黑原因 """
         try:
             if not user_id:
                 yield event.plain_result("请指定用户ID")
@@ -181,7 +168,7 @@ class MyPlugin(Star):
                 yield event.plain_result("时长不能为负数")
                 return
 
-            if duration > 0 and self.max_blacklist_duration and duration > self.max_blacklist_duration:
+            if self.max_blacklist_duration and duration > self.max_blacklist_duration:
                 yield event.plain_result(f"时长不能超过最大限制: {self.max_blacklist_duration}秒")
                 return
 
@@ -199,13 +186,10 @@ class MyPlugin(Star):
             logger.error(f"添加黑名单时出错：{e}")
             yield event.plain_result(f"添加黑名单失败: {str(e)}")
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @blacklist.command("rm")
+@filter.permission_type(filter.PermissionType.ADMIN)
+@blacklist.command("rm")
     async def rm(self, event: AstrMessageEvent, user_id: str):
-        """从黑名单移除用户
-        Args:
-            user_id: 要移除的用户ID
-        """
+        """从黑名单移除用户 Args: user_id: 要移除的用户ID """
         try:
             if not user_id:
                 yield event.plain_result("请指定用户ID")
@@ -219,13 +203,10 @@ class MyPlugin(Star):
             logger.error(f"移除黑名单时出错：{e}")
             yield event.plain_result(f"移除黑名单失败: {str(e)}")
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @blacklist.command("info")
+@filter.permission_type(filter.PermissionType.ADMIN)
+@blacklist.command("info")
     async def info(self, event: AstrMessageEvent, user_id: str):
-        """查看特定用户黑名单信息
-        Args:
-            user_id: 要查询的用户ID
-        """
+        """查看特定用户黑名单信息 Args: user_id: 要查询的用户ID """
         try:
             if not user_id:
                 yield event.plain_result("请指定用户ID")
@@ -245,8 +226,8 @@ class MyPlugin(Star):
             logger.error(f"查询黑名单信息时出错：{e}")
             yield event.plain_result(f"查询黑名单信息失败: {str(e)}")
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @blacklist.command("clear")
+@filter.permission_type(filter.PermissionType.ADMIN)
+@blacklist.command("clear")
     async def clear(self, event: AstrMessageEvent):
         """清空黑名单"""
         try:
@@ -258,82 +239,79 @@ class MyPlugin(Star):
 
     # ==================== 人际关系管理功能 ====================
     
-    @filter.permission_type(PermissionType.ADMIN)
-    @filter.command("群列表")
+@filter.permission_type(PermissionType.ADMIN)
+@filter.command("群列表")
     async def get_group_list(self, event: AiocqhttpMessageEvent):
         """查看bot加入的所有群聊信息"""
         async for msg in self.normal.get_group_list(event):
             yield msg
 
-    @filter.permission_type(PermissionType.ADMIN)
-    @filter.command("好友列表")
+@filter.permission_type(PermissionType.ADMIN)
+@filter.command("好友列表")
     async def get_friend_list(self, event: AiocqhttpMessageEvent):
         """查看bot的所有好友信息"""
         async for msg in self.normal.get_friend_list(event):
             yield msg
 
-    @filter.permission_type(PermissionType.ADMIN)
-    @filter.command("退群")
+@filter.permission_type(PermissionType.ADMIN)
+@filter.command("退群")
     async def set_group_leave(self, event: AiocqhttpMessageEvent):
         """退群 <序号|群号|区间> [可批量]"""
         async for msg in self.normal.set_group_leave(event):
             yield msg
 
-    @filter.permission_type(PermissionType.ADMIN)
-    @filter.command("删好友", alias={"删除好友"})
+@filter.permission_type(PermissionType.ADMIN)
+@filter.command("删好友", alias={"删除好友"})
     async def delete_friend(self, event: AiocqhttpMessageEvent):
         """删好友 <@昵称|QQ|序号|区间> [可批量]"""
         async for msg in self.normal.delete_friend(event):
             yield msg
 
-    @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+@filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
+@filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_notice(self, event: AiocqhttpMessageEvent):
         """监听群聊相关事件（如管理员变动、禁言、踢出、邀请等），自动处理并反馈"""
         async for msg in self.notice.handle(event):
             yield msg
 
-    @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
+@filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
+@filter.event_message_type(filter.EventMessageType.ALL)
     async def on_request(self, event: AiocqhttpMessageEvent):
         """监听好友申请或群邀请"""
         async for msg in self.request.handle_raw(event):
             yield msg
 
-    @filter.command("同意")
+@filter.command("同意")
     async def agree(self, event: AiocqhttpMessageEvent, extra: str = ""):
         """同意好友申请或群邀请"""
         async for msg in self.request.handle_cmd(event, approve=True, extra=extra):
             yield msg
 
-    @filter.command("拒绝")
+@filter.command("拒绝")
     async def refuse(self, event: AiocqhttpMessageEvent, extra: str = ""):
         """拒绝好友申请或群邀请"""
         async for msg in self.request.handle_cmd(event, approve=False, extra=extra):
             yield msg
 
-    @filter.command("加群")
+@filter.command("加群")
     async def add_group(self, event: AiocqhttpMessageEvent):
         """加群 [群号] [答案]"""
-        try:
-            from .core.expansion import ExpansionHandle
-        except ImportError:
+        if not self.expansion_available:
             yield event.plain_result("该功能不对普通用户开放")
             return
-        async for msg in ExpansionHandle.add_group(event):
+        async for msg in self.expansion_handle.add_group(event):
             yield msg
 
-    @filter.command("加好友")
+@filter.command("加好友")
     async def add_friend(self, event: AiocqhttpMessageEvent):
         """加好友 [QQ号/@某人] [验证消息] [备注] [答案]"""
-        try:
-            from .core.expansion import ExpansionHandle
-        except ImportError:
+        if not self.expansion_available:
             yield event.plain_result("该功能不对普通用户开放")
             return
-        async for msg in ExpansionHandle.add_friend(event):
+        async for msg in self.expansion_handle.add_friend(event):
             yield msg
 
-    @filter.command("推荐")
+@filter.command("推荐")
     async def on_contact(self, event: AiocqhttpMessageEvent):
         """推荐 <群号/@群友/@qq>"""
         await self.contact.contact(event)
