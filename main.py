@@ -13,7 +13,7 @@ from astrbot.api import logger
     "astrbot_plugin_relationship_manager",
     "YourName",
     "AstrBot 关系管理插件",
-    "2.1.0",
+    "3.0.0",
     "https://github.com/your-repo/astrbot_plugin_relationship_manager",
 )
 class RelationshipManager(Star):
@@ -60,7 +60,9 @@ class RelationshipManager(Star):
         changed = False
         for uid, val in list(self.blacklist.items()):
             if isinstance(val, str):
-                self.blacklist[uid] = dict(time=now, block_msg=True, block_friend=True, block_group_invite=True)
+                self.blacklist[uid] = dict(
+                    time=now, block_msg=True, block_friend=True, block_group_invite=True
+                )
                 changed = True
             elif isinstance(val, dict) and "reason" in val:
                 val.pop("reason", None)
@@ -80,6 +82,14 @@ class RelationshipManager(Star):
         if kind == "all":
             return True
         return self.blacklist[uid].get(f"block_{kind}", True)
+
+    def _sender_blocked(self, event: AstrMessageEvent) -> bool:
+        """检查消息发送者是否被拉黑"""
+        try:
+            uid = str(event.get_sender_id())
+            return uid and self._blocked(uid, "msg")
+        except Exception:
+            return False
 
     @staticmethod
     def _ids(text: str) -> List[str]:
@@ -103,7 +113,6 @@ class RelationshipManager(Star):
                 await self._api("send_private_msg", user_id=int(aid), message=msg)
 
     async def _notify_with_ids(self, msg: str) -> List[str]:
-        """发送通知并收集消息ID"""
         ids = []
         if self.notify_group:
             res = await self._api("send_group_msg", group_id=int(self.notify_group), message=msg)
@@ -120,14 +129,7 @@ class RelationshipManager(Star):
                         ids.append(str(mid))
         return ids
 
-    def _stop(self, event: AstrMessageEvent):
-        try:
-            event.stop_event()
-        except Exception:
-            pass
-
     def _get_reply_id(self, event: AstrMessageEvent) -> Optional[str]:
-        """安全提取被引用消息的ID"""
         try:
             for comp in event.message_obj.message:
                 if hasattr(comp, "type") and comp.type == "reply":
@@ -151,96 +153,12 @@ class RelationshipManager(Star):
                 return flag
         return None
 
-    # ───────── 消息拦截 ─────────
-
-    @filter.on_all_message
-    async def on_message(self, event: AstrMessageEvent):
-        """拦截黑名单用户消息"""
-        sender = str(event.get_sender_id())
-        if sender and self._blocked(sender, "msg"):
-            self._stop(event)
-            return
-
-    # ───────── 请求事件处理 ─────────
-
-    @filter.on_request
-    async def on_request(self, event: AstrMessageEvent):
-        """监听好友申请和群邀请"""
-        try:
-            raw = event.message_obj.raw_message
-        except Exception:
-            return
-        if not isinstance(raw, dict):
-            return
-
-        req = raw.get("request_type")
-        if req == "friend":
-            await self._handle_friend_req(raw)
-            self._stop(event)
-        elif req == "group" and raw.get("sub_type") == "invite":
-            await self._handle_group_req(raw)
-            self._stop(event)
-
-    async def _handle_friend_req(self, raw: dict):
-        uid = str(raw.get("user_id", ""))
-        flag = str(raw.get("flag", ""))
-        comment = raw.get("comment", "") or ""
-        if not uid or not flag:
-            return
-
-        if self._blocked(uid, "friend"):
-            await self._api("set_friend_add_request", flag=flag, approve=False)
-            await self._notify(f"🚫 自动拒绝黑名单好友申请\n用户: {uid}")
-            return
-
-        self.pending[flag] = dict(
-            type="friend", user_id=uid, comment=comment,
-            time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            notify_ids=[],
-        )
-        self._save(self.pd_file, self.pending)
-
-        msg_ids = await self._notify_with_ids(
-            f"📥 新好友申请\n用户: {uid}\n理由: {comment}\n"
-            f"💬 引用此消息回复: /同意 或 /拒绝"
-        )
-        if msg_ids:
-            self.pending[flag]["notify_ids"] = msg_ids
-            self._save(self.pd_file, self.pending)
-
-    async def _handle_group_req(self, raw: dict):
-        uid = str(raw.get("user_id", ""))
-        gid = str(raw.get("group_id", ""))
-        flag = str(raw.get("flag", ""))
-        comment = raw.get("comment", "") or ""
-        sub = raw.get("sub_type", "invite")
-        if not flag:
-            return
-
-        if self._blocked(uid, "group_invite"):
-            await self._api("set_group_add_request", flag=flag, approve=False, sub_type=sub)
-            await self._notify(f"🚫 自动拒绝黑名单群邀请\n邀请人: {uid}\n群号: {gid}")
-            return
-
-        self.pending[flag] = dict(
-            type="group", group_id=gid, user_id=uid, sub_type=sub, comment=comment,
-            time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            notify_ids=[],
-        )
-        self._save(self.pd_file, self.pending)
-
-        msg_ids = await self._notify_with_ids(
-            f"📥 新群邀请\n群号: {gid}\n邀请人: {uid}\n理由: {comment}\n"
-            f"💬 引用此消息回复: /同意群 或 /拒绝群"
-        )
-        if msg_ids:
-            self.pending[flag]["notify_ids"] = msg_ids
-            self._save(self.pd_file, self.pending)
-
     # ───────── 查看列表 ─────────
 
     @filter.command("好友", alias=["fl"])
     async def cmd_friends(self, event: AstrMessageEvent):
+        if self._sender_blocked(event):
+            return
         if not self._is_admin(event):
             yield event.plain_result("❌ 仅管理员可用")
             return
@@ -265,6 +183,8 @@ class RelationshipManager(Star):
 
     @filter.command("群", alias=["gl"])
     async def cmd_groups(self, event: AstrMessageEvent):
+        if self._sender_blocked(event):
+            return
         if not self._is_admin(event):
             yield event.plain_result("❌ 仅管理员可用")
             return
@@ -289,6 +209,8 @@ class RelationshipManager(Star):
 
     @filter.command("拉黑", alias=["addbl", "屏蔽"])
     async def cmd_bl_add(self, event: AstrMessageEvent, args: str = ""):
+        if self._sender_blocked(event):
+            return
         if not self._is_admin(event):
             yield event.plain_result("❌ 仅管理员可用")
             return
@@ -304,7 +226,9 @@ class RelationshipManager(Star):
             if u in self.blacklist:
                 dup.append(u)
             else:
-                self.blacklist[u] = dict(time=now, block_msg=True, block_friend=True, block_group_invite=True)
+                self.blacklist[u] = dict(
+                    time=now, block_msg=True, block_friend=True, block_group_invite=True
+                )
                 added.append(u)
         self._save(self.bl_file, self.blacklist)
 
@@ -317,6 +241,8 @@ class RelationshipManager(Star):
 
     @filter.command("解封", alias=["rmbl", "取消屏蔽"])
     async def cmd_bl_rm(self, event: AstrMessageEvent, args: str = ""):
+        if self._sender_blocked(event):
+            return
         if not self._is_admin(event):
             yield event.plain_result("❌ 仅管理员可用")
             return
@@ -344,6 +270,8 @@ class RelationshipManager(Star):
 
     @filter.command("黑名单", alias=["lsbl"])
     async def cmd_bl_ls(self, event: AstrMessageEvent):
+        if self._sender_blocked(event):
+            return
         if not self._is_admin(event):
             yield event.plain_result("❌ 仅管理员可用")
             return
@@ -365,6 +293,8 @@ class RelationshipManager(Star):
 
     @filter.command("待处理", alias=["pending"])
     async def cmd_pending(self, event: AstrMessageEvent):
+        if self._sender_blocked(event):
+            return
         if not self._is_admin(event):
             yield event.plain_result("❌ 仅管理员可用")
             return
@@ -389,10 +319,78 @@ class RelationshipManager(Star):
 
         yield event.plain_result("\n".join(lines))
 
+    # ───────── 好友申请录入 ─────────
+
+    @filter.command("录入好友申请", alias=["addfr"])
+    async def cmd_add_friend_req(self, event: AstrMessageEvent, args: str = ""):
+        """手动录入好友申请到待处理列表
+
+        用法: /录入好友申请 QQ号 [附言]
+        """
+        if self._sender_blocked(event):
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 仅管理员可用")
+            return
+
+        parts = args.strip().split(maxsplit=1)
+        uids = self._ids(args)
+        if not uids:
+            yield event.plain_result("⚠️ /录入好友申请 QQ号 [附言]")
+            return
+
+        uid = uids[0]
+        comment = parts[1] if len(parts) > 1 else ""
+        flag = f"fr_{uid}_{int(datetime.now().timestamp())}"
+
+        self.pending[flag] = dict(
+            type="friend", user_id=uid, comment=comment,
+            time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            notify_ids=[],
+        )
+        self._save(self.pd_file, self.pending)
+
+        yield event.plain_result(f"✅ 已录入好友申请\n用户: {uid}\nFlag: {flag}\n/同意 {flag} 或 /拒绝 {flag}")
+
+    # ───────── 群邀请录入 ─────────
+
+    @filter.command("录入群邀请", alias=["addgi"])
+    async def cmd_add_group_invite(self, event: AstrMessageEvent, args: str = ""):
+        """手动录入群邀请到待处理列表
+
+        用法: /录入群邀请 群号 邀请人QQ号
+        """
+        if self._sender_blocked(event):
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 仅管理员可用")
+            return
+
+        nums = self._ids(args)
+        if len(nums) < 2:
+            yield event.plain_result("⚠️ /录入群邀请 群号 邀请人QQ号")
+            return
+
+        gid, uid = nums[0], nums[1]
+        flag = f"gi_{gid}_{int(datetime.now().timestamp())}"
+
+        self.pending[flag] = dict(
+            type="group", group_id=gid, user_id=uid, sub_type="invite", comment="",
+            time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            notify_ids=[],
+        )
+        self._save(self.pd_file, self.pending)
+
+        yield event.plain_result(
+            f"✅ 已录入群邀请\n群号: {gid}\n邀请人: {uid}\nFlag: {flag}\n/同意群 {flag} 或 /拒绝群 {flag}"
+        )
+
     # ───────── 删好友 / 退群 ─────────
 
     @filter.command("删好友", alias=["deletefriend"])
     async def cmd_del_friend(self, event: AstrMessageEvent, args: str = ""):
+        if self._sender_blocked(event):
+            return
         if not self._is_admin(event):
             yield event.plain_result("❌ 仅管理员可用")
             return
@@ -416,6 +414,8 @@ class RelationshipManager(Star):
 
     @filter.command("退群", alias=["leavegroup"])
     async def cmd_leave_group(self, event: AstrMessageEvent, args: str = ""):
+        if self._sender_blocked(event):
+            return
         if not self._is_admin(event):
             yield event.plain_result("❌ 仅管理员可用")
             return
@@ -440,6 +440,8 @@ class RelationshipManager(Star):
     # ───────── 同意 / 拒绝 ─────────
 
     async def _process_flags(self, event, args, approve: bool, allow_type: str = "all"):
+        if self._sender_blocked(event):
+            return
         if not self._is_admin(event):
             yield event.plain_result("❌ 仅管理员可用")
             return
@@ -463,7 +465,6 @@ class RelationshipManager(Star):
 
         for flag in flags:
             info = self.pending.get(flag)
-
             if not info:
                 miss.append(flag)
                 continue
@@ -507,21 +508,25 @@ class RelationshipManager(Star):
 
     @filter.command("同意", alias=["accept"])
     async def cmd_accept(self, event: AstrMessageEvent, args: str = ""):
+        """引用通知消息回复 /同意，或 /同意 flag"""
         async for result in self._process_flags(event, args, approve=True, allow_type="all"):
             yield result
 
     @filter.command("拒绝", alias=["reject"])
     async def cmd_reject(self, event: AstrMessageEvent, args: str = ""):
+        """引用通知消息回复 /拒绝，或 /拒绝 flag"""
         async for result in self._process_flags(event, args, approve=False, allow_type="all"):
             yield result
 
     @filter.command("同意群", alias=["acceptgroup"])
     async def cmd_accept_group(self, event: AstrMessageEvent, args: str = ""):
+        """引用通知消息回复 /同意群，或 /同意群 flag"""
         async for result in self._process_flags(event, args, approve=True, allow_type="group"):
             yield result
 
     @filter.command("拒绝群", alias=["rejectgroup"])
     async def cmd_reject_group(self, event: AstrMessageEvent, args: str = ""):
+        """引用通知消息回复 /拒绝群，或 /拒绝群 flag"""
         async for result in self._process_flags(event, args, approve=False, allow_type="group"):
             yield result
 
