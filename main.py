@@ -1,9 +1,11 @@
 import os
 import json
+import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
+from datetime import datetime
 
-from astrbot.api.event import filter, EventMessageType, AstrMessageEvent
+from astrbot.api.event import filter, EventMessageType, AstrMessageEvent, GroupRequestEvent, FriendRequestEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import Plain, Image
 from astrbot.api import logger
@@ -12,27 +14,54 @@ from astrbot.api import logger
 @register(
     "astrbot_plugin_relationship_manager",
     "YourName",
-    "AstrBot 关系管理插件 - 简化指令版",
-    "1.0.0",
+    "AstrBot 关系管理插件 - 批量指令版",
+    "1.2.0",
     "https://github.com/your-repo/astrbot_plugin_relationship_manager"
 )
 class RelationshipManagerPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        # 初始化黑名单数据路径
+        # 初始化数据路径
         self.data_path = Path(context.get_astrbot_config().get("data_path", "data")) / "plugins" / "astrbot_plugin_relationship_manager"
         self.data_path.mkdir(parents=True, exist_ok=True)
         self.blacklist_file = self.data_path / "blacklist.json"
-        self.blacklist: Dict[str, str] = self.load_blacklist()
-        # 存储待处理的申请和邀请，格式: {flag: {'type': 'friend'|'group', 'user_id': ..., 'comment': ...}}
-        self.pending_requests: Dict[str, dict] = {}
+        self.pending_file = self.data_path / "pending_requests.json"
         
-    def load_blacklist(self) -> Dict[str, str]:
+        # 黑名单格式: {user_id: {"time": "xxx", "block_msg": True, "block_friend": True, "block_group_invite": True}}
+        self.blacklist: Dict[str, dict] = self.load_blacklist()
+        self.pending_requests: Dict[str, dict] = self.load_pending_requests()
+        
+        # 通知配置
+        self.notify_enabled = True
+        self.notify_group_id = None
+
+    def load_blacklist(self) -> Dict[str, dict]:
         """加载黑名单"""
         if self.blacklist_file.exists():
             try:
                 with open(self.blacklist_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    # 兼容旧格式
+                    converted = {}
+                    for k, v in data.items():
+                        if isinstance(v, str):
+                            converted[k] = {
+                                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "block_msg": True,
+                                "block_friend": True,
+                                "block_group_invite": True
+                            }
+                        elif isinstance(v, dict) and "reason" in v:
+                            # 去掉旧版的reason字段
+                            converted[k] = {
+                                "time": v.get("time", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                                "block_msg": v.get("block_msg", True),
+                                "block_friend": v.get("block_friend", True),
+                                "block_group_invite": v.get("block_group_invite", True)
+                            }
+                        else:
+                            converted[k] = v
+                    return converted
             except Exception as e:
                 logger.error(f"加载黑名单失败: {e}")
                 return {}
@@ -46,29 +75,80 @@ class RelationshipManagerPlugin(Star):
         except Exception as e:
             logger.error(f"保存黑名单失败: {e}")
 
+    def load_pending_requests(self) -> Dict[str, dict]:
+        """加载待处理请求"""
+        if self.pending_file.exists():
+            try:
+                with open(self.pending_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"加载待处理请求失败: {e}")
+                return {}
+        return {}
+
+    def save_pending_requests(self):
+        """保存待处理请求"""
+        try:
+            with open(self.pending_file, 'w', encoding='utf-8') as f:
+                json.dump(self.pending_requests, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存待处理请求失败: {e}")
+
     def is_admin(self, event: AstrMessageEvent) -> bool:
         """检查用户是否为管理员"""
         admin_ids = self.context.get_astrbot_config().get("admins", [])
         sender_id = str(event.get_sender_id())
         return sender_id in [str(admin_id) for admin_id in admin_ids]
 
-    def get_platform_api_name(self, api_name: str) -> str:
-        """根据平台获取正确的API名称（适配不同协议）"""
-        # 这里可以根据平台信息进行更精确的适配
-        # 简单起见，假设大部分平台兼容OneBot v11的API名称
-        return api_name
+    def is_blacklisted(self, user_id: str, check_type: str = "all") -> bool:
+        """检查用户是否在黑名单中"""
+        if user_id not in self.blacklist:
+            return False
+        if check_type == "all":
+            return True
+        info = self.blacklist[user_id]
+        if check_type == "msg":
+            return info.get("block_msg", True)
+        elif check_type == "friend":
+            return info.get("block_friend", True)
+        elif check_type == "group_invite":
+            return info.get("block_group_invite", True)
+        return True
+
+    def extract_ids(self, text: str) -> List[str]:
+        """从文本中提取所有纯数字ID"""
+        return re.findall(r'\d+', text)
 
     async def call_platform_api(self, api_name: str, **kwargs) -> Optional[dict]:
         """安全调用平台API的包装方法"""
         try:
-            return await self.call_api(self.get_platform_api_name(api_name), **kwargs)
+            return await self.call_api(api_name, **kwargs)
         except Exception as e:
             logger.error(f"调用API {api_name} 失败: {e}")
             return None
 
+    async def send_notification(self, message: str):
+        """发送通知到管理员"""
+        if self.notify_group_id:
+            await self.call_platform_api("send_group_msg", group_id=int(self.notify_group_id), message=message)
+        else:
+            admin_ids = self.context.get_astrbot_config().get("admins", [])
+            for admin_id in admin_ids:
+                await self.call_platform_api("send_private_msg", user_id=int(admin_id), message=message)
+
+    # ================= 消息拦截器 =================
+    @filter.event_message_type(EventMessageType.ALL)
+    async def block_blacklist_messages(self, event: AstrMessageEvent):
+        """拦截黑名单用户的所有消息"""
+        sender_id = str(event.get_sender_id())
+        if self.is_blacklisted(sender_id, "msg"):
+            logger.debug(f"已屏蔽黑名单用户 {sender_id} 的消息")
+            event.stop_event()
+            return
+
     # ================= 列表查看指令 =================
-    @filter.command("好友列表", alias={"好友", "fl"})
-    async def friend_list(self, event: AstrMessageEvent):
+    @filter.command("好友", alias=["fl"])
+    async def friend_list(self, event: AstrMessageEvent, args: str = ""):
         """查看好友列表"""
         if not self.is_admin(event):
             yield event.plain_result("❌ 此命令仅管理员可用。")
@@ -78,20 +158,22 @@ class RelationshipManagerPlugin(Star):
         if result and result.get('status') == 'ok':
             friends = result.get('data', [])
             if not friends:
-                yield event.plain_result("📋 你当前没有好友。")
+                yield event.plain_result("📋 当前没有好友。")
                 return
 
-            reply = ["📋 **Bot 好友列表**\n"]
+            reply = ["📋 **好友列表**\n"]
             for i, friend in enumerate(friends, 1):
-                reply.append(f"{i}. {friend.get('nickname', 'Unknown')} (ID: {friend.get('user_id', 'Unknown')})")
-            
-            # 如果列表很长，可以考虑分页或生成图片（可集成其他插件）
+                uid = friend.get('user_id', 'Unknown')
+                nick = friend.get('nickname', 'Unknown')
+                tag = " 🚫" if self.is_blacklisted(str(uid)) else ""
+                reply.append(f"{i}. {nick} ({uid}){tag}")
+
             yield event.plain_result("\n".join(reply))
         else:
             yield event.plain_result("❌ 获取好友列表失败，请检查平台适配器是否支持此功能。")
 
-    @filter.command("群列表", alias={"群", "gl"})
-    async def group_list(self, event: AstrMessageEvent):
+    @filter.command("群", alias=["gl"])
+    async def group_list(self, event: AstrMessageEvent, args: str = ""):
         """查看群列表"""
         if not self.is_admin(event):
             yield event.plain_result("❌ 此命令仅管理员可用。")
@@ -101,74 +183,110 @@ class RelationshipManagerPlugin(Star):
         if result and result.get('status') == 'ok':
             groups = result.get('data', [])
             if not groups:
-                yield event.plain_result("📋 你当前没有加入任何群。")
+                yield event.plain_result("📋 当前没有加入任何群。")
                 return
 
-            reply = ["📋 **Bot 群列表**\n"]
+            reply = ["📋 **群列表**\n"]
             for i, group in enumerate(groups, 1):
-                reply.append(f"{i}. {group.get('group_name', 'Unknown')} (ID: {group.get('group_id', 'Unknown')})")
-            
+                reply.append(f"{i}. {group.get('group_name', 'Unknown')} ({group.get('group_id', 'Unknown')})")
+
             yield event.plain_result("\n".join(reply))
         else:
             yield event.plain_result("❌ 获取群列表失败，请检查平台适配器是否支持此功能。")
 
-    # ================= 黑名单管理指令 =================
-    @filter.command("拉黑", alias={"黑名单", "addbl"})
-    async def add_to_blacklist(self, event: AstrMessageEvent, target: str = ""):
-        """拉黑用户"""
+    # ================= 黑名单管理指令（支持批量）=================
+    @filter.command("拉黑", alias=["addbl", "屏蔽"])
+    async def add_to_blacklist(self, event: AstrMessageEvent, args: str = ""):
+        """批量拉黑用户，屏蔽所有消息、好友申请和群邀请
+        
+        用法: 
+          /拉黑 123456
+          /拉黑 123456 789012 345678
+        """
         if not self.is_admin(event):
             yield event.plain_result("❌ 此命令仅管理员可用。")
             return
 
-        if not target:
-            yield event.plain_result("⚠️ 用法: /拉黑 [QQ号 或 @用户]")
+        args = args.strip()
+        if not args:
+            yield event.plain_result("⚠️ 用法: /拉黑 [QQ号1] [QQ号2] ...")
             return
 
-        # 尝试解析QQ号（可能从@消息中提取）
-        if target.startswith("@"):
-            # 这里需要根据平台协议从@消息中提取真实的QQ号
-            # 简化处理，假设用户输入了纯数字QQ号
-            user_id = target[1:]
-        else:
-            user_id = target
-
-        if not user_id.isdigit():
-            yield event.plain_result("❌ 无效的用户ID，请输入纯数字QQ号。")
+        # 提取所有数字ID
+        all_ids = self.extract_ids(args)
+        if not all_ids:
+            yield event.plain_result("❌ 未检测到有效的QQ号。")
             return
 
-        self.blacklist[user_id] = "手动拉黑"
+        # 批量写入黑名单
+        added = []
+        already = []
+        for user_id in all_ids:
+            if user_id in self.blacklist:
+                already.append(user_id)
+            else:
+                self.blacklist[user_id] = {
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "block_msg": True,
+                    "block_friend": True,
+                    "block_group_invite": True
+                }
+                added.append(user_id)
+
         self.save_blacklist()
-        yield event.plain_result(f"✅ 已将用户 {user_id} 加入黑名单。")
 
-    @filter.command("解封", alias={"解除黑名单", "rmbl"})
-    async def remove_from_blacklist(self, event: AstrMessageEvent, target: str = ""):
-        """解封用户"""
+        reply_parts = []
+        if added:
+            reply_parts.append(f"✅ 已拉黑 {len(added)} 人: {', '.join(added)}")
+        if already:
+            reply_parts.append(f"⚠️ 已在黑名单: {', '.join(already)}")
+        reply_parts.append("屏蔽: 消息 ✅ | 好友申请 ✅ | 群邀请 ✅")
+
+        yield event.plain_result("\n".join(reply_parts))
+
+    @filter.command("解封", alias=["rmbl", "取消屏蔽"])
+    async def remove_from_blacklist(self, event: AstrMessageEvent, args: str = ""):
+        """批量解封用户
+        
+        用法:
+          /解封 123456
+          /解封 123456 789012 345678
+        """
         if not self.is_admin(event):
             yield event.plain_result("❌ 此命令仅管理员可用。")
             return
 
-        if not target:
-            yield event.plain_result("⚠️ 用法: /解封 [QQ号 或 @用户]")
+        args = args.strip()
+        if not args:
+            yield event.plain_result("⚠️ 用法: /解封 [QQ号1] [QQ号2] ...")
             return
 
-        if target.startswith("@"):
-            user_id = target[1:]
-        else:
-            user_id = target
-
-        if not user_id.isdigit():
-            yield event.plain_result("❌ 无效的用户ID，请输入纯数字QQ号。")
+        all_ids = self.extract_ids(args)
+        if not all_ids:
+            yield event.plain_result("❌ 未检测到有效的QQ号。")
             return
 
-        if user_id in self.blacklist:
-            del self.blacklist[user_id]
-            self.save_blacklist()
-            yield event.plain_result(f"✅ 已将用户 {user_id} 移出黑名单。")
-        else:
-            yield event.plain_result(f"⚠️ 用户 {user_id} 不在黑名单中。")
+        removed = []
+        not_found = []
+        for user_id in all_ids:
+            if user_id in self.blacklist:
+                del self.blacklist[user_id]
+                removed.append(user_id)
+            else:
+                not_found.append(user_id)
 
-    @filter.command("黑名单", alias={"查看黑名单", "lsbl"})
-    async def show_blacklist(self, event: AstrMessageEvent):
+        self.save_blacklist()
+
+        reply_parts = []
+        if removed:
+            reply_parts.append(f"✅ 已解封 {len(removed)} 人: {', '.join(removed)}")
+        if not_found:
+            reply_parts.append(f"⚠️ 不在黑名单: {', '.join(not_found)}")
+
+        yield event.plain_result("\n".join(reply_parts))
+
+    @filter.command("黑名单", alias=["lsbl"])
+    async def show_blacklist(self, event: AstrMessageEvent, args: str = ""):
         """查看黑名单"""
         if not self.is_admin(event):
             yield event.plain_result("❌ 此命令仅管理员可用。")
@@ -178,152 +296,418 @@ class RelationshipManagerPlugin(Star):
             yield event.plain_result("📋 当前黑名单为空。")
             return
 
-        reply = ["🚫 **黑名单列表**\n"]
-        for user_id, reason in self.blacklist.items():
-            reply.append(f"- {user_id} (理由: {reason})")
-        
+        reply = [f"🚫 **黑名单** (共 {len(self.blacklist)} 人)\n"]
+        for user_id, info in self.blacklist.items():
+            if isinstance(info, dict):
+                block_msg = "✅" if info.get("block_msg", True) else "❌"
+                block_friend = "✅" if info.get("block_friend", True) else "❌"
+                block_group = "✅" if info.get("block_group_invite", True) else "❌"
+                time_str = info.get("time", "未知")
+                reply.append(f"- {user_id} | {time_str} | 消息{block_msg} 好友{block_friend} 群邀请{block_group}")
+            else:
+                reply.append(f"- {user_id}")
+
         yield event.plain_result("\n".join(reply))
 
-    # ================= 好友与群管理指令（简化版） =================
-    # 注意：以下API调用需根据实际平台适配器调整
-
-    @filter.command("删好友", alias={"deletefriend"})
-    async def delete_friend(self, event: AstrMessageEvent, target: str = ""):
-        """删除好友"""
+    # ================= 待处理请求列表指令 =================
+    @filter.command("待处理", alias=["pending"])
+    async def show_pending_requests(self, event: AstrMessageEvent, args: str = ""):
+        """查看待处理的好友申请和群邀请"""
         if not self.is_admin(event):
             yield event.plain_result("❌ 此命令仅管理员可用。")
             return
 
-        if not target:
-            yield event.plain_result("⚠️ 用法: /删好友 [序号 或 QQ号 或 @用户]")
+        if not self.pending_requests:
+            yield event.plain_result("📋 当前没有待处理的请求。")
             return
 
-        # 尝试从序号解析（需要先获取列表，这里简化为直接使用ID）
-        # 实际应用中，可以先调用 `get_friend_list` 获取所有好友，建立序号到ID的映射
-        user_id = target.lstrip('@') # 简单去除@
+        reply = ["📋 **待处理请求**\n"]
+        for flag, info in self.pending_requests.items():
+            if info['type'] == 'friend':
+                reply.append(
+                    f"🔹 好友申请 [{flag}]\n"
+                    f"   用户: {info['user_id']}\n"
+                    f"   理由: {info.get('comment', '无')}\n"
+                    f"   时间: {info.get('time', '未知')}\n"
+                    f"   处理: /同意 {flag} 或 /拒绝 {flag}\n"
+                )
+            elif info['type'] == 'group':
+                reply.append(
+                    f"🔸 群邀请 [{flag}]\n"
+                    f"   群号: {info['group_id']}\n"
+                    f"   邀请人: {info['user_id']}\n"
+                    f"   理由: {info.get('comment', '无')}\n"
+                    f"   时间: {info.get('time', '未知')}\n"
+                    f"   处理: /同意群 {flag} 或 /拒绝群 {flag}\n"
+                )
 
-        if not user_id.isdigit():
-            yield event.plain_result("❌ 无效的用户ID，请输入纯数字QQ号或序号。")
-            return
+        yield event.plain_result("\n".join(reply))
 
-        result = await self.call_platform_api("delete_friend", user_id=int(user_id))
-        if result and result.get('status') == 'ok':
-            yield event.plain_result(f"✅ 已删除好友 {user_id}。")
-        else:
-            yield event.plain_result(f"❌ 删除好友失败: {result.get('msg', '未知错误')}")
-
-    @filter.command("退群", alias={"leavegroup"})
-    async def leave_group(self, event: AstrMessageEvent, target: str = ""):
-        """退出群聊"""
+    # ================= 好友与群管理指令（支持批量）=================
+    @filter.command("删好友", alias=["deletefriend"])
+    async def delete_friend(self, event: AstrMessageEvent, args: str = ""):
+        """批量删除好友
+        
+        用法:
+          /删好友 123456
+          /删好友 123456 789012 345678
+        """
         if not self.is_admin(event):
             yield event.plain_result("❌ 此命令仅管理员可用。")
             return
 
-        if not target:
-            yield event.plain_result("⚠️ 用法: /退群 [序号 或 群号]")
+        args = args.strip()
+        if not args:
+            yield event.plain_result("⚠️ 用法: /删好友 [QQ号1] [QQ号2] ...")
             return
 
-        group_id = target.lstrip('@')
-        if not group_id.isdigit():
-            yield event.plain_result("❌ 无效的群号，请输入纯数字群号或序号。")
+        all_ids = self.extract_ids(args)
+        if not all_ids:
+            yield event.plain_result("❌ 未检测到有效的QQ号。")
             return
 
-        result = await self.call_platform_api("set_group_leave", group_id=int(group_id))
-        if result and result.get('status') == 'ok':
-            yield event.plain_result(f"✅ 已退出群 {group_id}。")
-        else:
-            yield event.plain_result(f"❌ 退群失败: {result.get('msg', '未知错误')}")
+        success = []
+        failed = []
+        for user_id in all_ids:
+            result = await self.call_platform_api("delete_friend", user_id=int(user_id))
+            if result and result.get('status') == 'ok':
+                success.append(user_id)
+            else:
+                failed.append(user_id)
 
-    @filter.command("同意好友", alias={"acceptfriend"})
-    async def accept_friend_request(self, event: AstrMessageEvent, flag: str = ""):
-        """同意好友申请"""
+        reply_parts = []
+        if success:
+            reply_parts.append(f"✅ 已删除好友 {len(success)} 人: {', '.join(success)}")
+        if failed:
+            reply_parts.append(f"❌ 删除失败: {', '.join(failed)}")
+
+        yield event.plain_result("\n".join(reply_parts))
+
+    @filter.command("退群", alias=["leavegroup"])
+    async def leave_group(self, event: AstrMessageEvent, args: str = ""):
+        """批量退出群聊
+        
+        用法:
+          /退群 123456
+          /退群 123456 789012 345678
+        """
         if not self.is_admin(event):
             yield event.plain_result("❌ 此命令仅管理员可用。")
             return
 
-        if not flag:
-            yield event.plain_result("⚠️ 用法: /同意好友 [申请序号] (请先使用 /好友列表 查看待处理申请)")
+        args = args.strip()
+        if not args:
+            yield event.plain_result("⚠️ 用法: /退群 [群号1] [群号2] ...")
             return
 
-        # 实际中，flag需要从待处理申请中获取，这里简化处理
-        # 更好的方式是让管理员引用或回复申请消息来获取flag
-        result = await self.call_platform_api("set_friend_add_request", flag=flag, approve=True)
-        if result and result.get('status') == 'ok':
-            yield event.plain_result("✅ 已同意好友申请。")
-        else:
-            yield event.plain_result(f"❌ 同意失败: {result.get('msg', '未知错误')}")
+        all_ids = self.extract_ids(args)
+        if not all_ids:
+            yield event.plain_result("❌ 未检测到有效的群号。")
+            return
 
-    @filter.command("拒绝好友", alias={"rejectfriend"})
-    async def reject_friend_request(self, event: AstrMessageEvent, flag: str = ""):
-        """拒绝好友申请"""
+        success = []
+        failed = []
+        for group_id in all_ids:
+            result = await self.call_platform_api("set_group_leave", group_id=int(group_id))
+            if result and result.get('status') == 'ok':
+                success.append(group_id)
+            else:
+                failed.append(group_id)
+
+        reply_parts = []
+        if success:
+            reply_parts.append(f"✅ 已退群 {len(success)} 个: {', '.join(success)}")
+        if failed:
+            reply_parts.append(f"❌ 退群失败: {', '.join(failed)}")
+
+        yield event.plain_result("\n".join(reply_parts))
+
+    # ================= 请求处理指令（支持批量）=================
+    @filter.command("同意", alias=["accept"])
+    async def accept_request(self, event: AstrMessageEvent, args: str = ""):
+        """批量同意好友申请或群邀请
+        
+        用法:
+          /同意 flag1
+          /同意 flag1 flag2 flag3
+        """
         if not self.is_admin(event):
             yield event.plain_result("❌ 此命令仅管理员可用。")
             return
 
-        if not flag:
-            yield event.plain_result("⚠️ 用法: /拒绝好友 [申请序号]")
+        args = args.strip()
+        if not args:
+            yield event.plain_result("⚠️ 用法: /同意 [flag1] [flag2] ... (用 /待处理 查看flag)")
             return
 
-        result = await self.call_platform_api("set_friend_add_request", flag=flag, approve=False)
-        if result and result.get('status') == 'ok':
-            yield event.plain_result("✅ 已拒绝好友申请。")
-        else:
-            yield event.plain_result(f"❌ 拒绝失败: {result.get('msg', '未知错误')}")
+        flags = args.split()
+        success = []
+        failed = []
+        not_found = []
+
+        for flag in flags:
+            request_info = self.pending_requests.get(flag)
+            if not request_info:
+                not_found.append(flag)
+                continue
+
+            if request_info['type'] == 'friend':
+                result = await self.call_platform_api("set_friend_add_request", flag=flag, approve=True)
+            elif request_info['type'] == 'group':
+                sub_type = request_info.get('sub_type', 'invite')
+                result = await self.call_platform_api("set_group_add_request", flag=flag, approve=True, sub_type=sub_type)
+            else:
+                not_found.append(flag)
+                continue
+
+            if result and result.get('status') == 'ok':
+                if flag in self.pending_requests:
+                    del self.pending_requests[flag]
+                    self.save_pending_requests()
+                type_name = "好友" if request_info['type'] == 'friend' else "群"
+                success.append(f"{flag}({type_name})")
+            else:
+                failed.append(flag)
+
+        reply_parts = []
+        if success:
+            reply_parts.append(f"✅ 已同意 {len(success)} 项: {', '.join(success)}")
+        if not_found:
+            reply_parts.append(f"⚠️ 未找到: {', '.join(not_found)}")
+        if failed:
+            reply_parts.append(f"❌ 同意失败: {', '.join(failed)}")
+
+        yield event.plain_result("\n".join(reply_parts))
+
+    @filter.command("拒绝", alias=["reject"])
+    async def reject_request(self, event: AstrMessageEvent, args: str = ""):
+        """批量拒绝好友申请或群邀请
+        
+        用法:
+          /拒绝 flag1
+          /拒绝 flag1 flag2 flag3
+        """
+        if not self.is_admin(event):
+            yield event.plain_result("❌ 此命令仅管理员可用。")
+            return
+
+        args = args.strip()
+        if not args:
+            yield event.plain_result("⚠️ 用法: /拒绝 [flag1] [flag2] ... (用 /待处理 查看flag)")
+            return
+
+        flags = args.split()
+        success = []
+        failed = []
+        not_found = []
+
+        for flag in flags:
+            request_info = self.pending_requests.get(flag)
+            if not request_info:
+                not_found.append(flag)
+                continue
+
+            if request_info['type'] == 'friend':
+                result = await self.call_platform_api("set_friend_add_request", flag=flag, approve=False)
+            elif request_info['type'] == 'group':
+                sub_type = request_info.get('sub_type', 'invite')
+                result = await self.call_platform_api("set_group_add_request", flag=flag, approve=False, sub_type=sub_type)
+            else:
+                not_found.append(flag)
+                continue
+
+            if result and result.get('status') == 'ok':
+                if flag in self.pending_requests:
+                    del self.pending_requests[flag]
+                    self.save_pending_requests()
+                type_name = "好友" if request_info['type'] == 'friend' else "群"
+                success.append(f"{flag}({type_name})")
+            else:
+                failed.append(flag)
+
+        reply_parts = []
+        if success:
+            reply_parts.append(f"✅ 已拒绝 {len(success)} 项: {', '.join(success)}")
+        if not_found:
+            reply_parts.append(f"⚠️ 未找到: {', '.join(not_found)}")
+        if failed:
+            reply_parts.append(f"❌ 拒绝失败: {', '.join(failed)}")
+
+        yield event.plain_result("\n".join(reply_parts))
+
+    # ================= 群邀请专用指令（支持批量）=================
+    @filter.command("同意群", alias=["acceptgroup"])
+    async def accept_group_request(self, event: AstrMessageEvent, args: str = ""):
+        """批量同意群邀请
+        
+        用法:
+          /同意群 flag1
+          /同意群 flag1 flag2 flag3
+        """
+        if not self.is_admin(event):
+            yield event.plain_result("❌ 此命令仅管理员可用。")
+            return
+
+        args = args.strip()
+        if not args:
+            yield event.plain_result("⚠️ 用法: /同意群 [flag1] [flag2] ...")
+            return
+
+        flags = args.split()
+        success = []
+        failed = []
+        not_found = []
+
+        for flag in flags:
+            request_info = self.pending_requests.get(flag)
+            if not request_info or request_info['type'] != 'group':
+                not_found.append(flag)
+                continue
+
+            sub_type = request_info.get('sub_type', 'invite')
+            result = await self.call_platform_api("set_group_add_request", flag=flag, approve=True, sub_type=sub_type)
+            if result and result.get('status') == 'ok':
+                if flag in self.pending_requests:
+                    del self.pending_requests[flag]
+                    self.save_pending_requests()
+                success.append(flag)
+            else:
+                failed.append(flag)
+
+        reply_parts = []
+        if success:
+            reply_parts.append(f"✅ 已同意群邀请 {len(success)} 项: {', '.join(success)}")
+        if not_found:
+            reply_parts.append(f"⚠️ 非群邀请或未找到: {', '.join(not_found)}")
+        if failed:
+            reply_parts.append(f"❌ 同意失败: {', '.join(failed)}")
+
+        yield event.plain_result("\n".join(reply_parts))
+
+    @filter.command("拒绝群", alias=["rejectgroup"])
+    async def reject_group_request(self, event: AstrMessageEvent, args: str = ""):
+        """批量拒绝群邀请
+        
+        用法:
+          /拒绝群 flag1
+          /拒绝群 flag1 flag2 flag3
+        """
+        if not self.is_admin(event):
+            yield event.plain_result("❌ 此命令仅管理员可用。")
+            return
+
+        args = args.strip()
+        if not args:
+            yield event.plain_result("⚠️ 用法: /拒绝群 [flag1] [flag2] ...")
+            return
+
+        flags = args.split()
+        success = []
+        failed = []
+        not_found = []
+
+        for flag in flags:
+            request_info = self.pending_requests.get(flag)
+            if not request_info or request_info['type'] != 'group':
+                not_found.append(flag)
+                continue
+
+            sub_type = request_info.get('sub_type', 'invite')
+            result = await self.call_platform_api("set_group_add_request", flag=flag, approve=False, sub_type=sub_type)
+            if result and result.get('status') == 'ok':
+                if flag in self.pending_requests:
+                    del self.pending_requests[flag]
+                    self.save_pending_requests()
+                success.append(flag)
+            else:
+                failed.append(flag)
+
+        reply_parts = []
+        if success:
+            reply_parts.append(f"✅ 已拒绝群邀请 {len(success)} 项: {', '.join(success)}")
+        if not_found:
+            reply_parts.append(f"⚠️ 非群邀请或未找到: {', '.join(not_found)}")
+        if failed:
+            reply_parts.append(f"❌ 拒绝失败: {', '.join(failed)}")
+
+        yield event.plain_result("\n".join(reply_parts))
 
     # ================= 事件监听器 =================
-    @filter.event_message_type(EventMessageType.ALL)
-    async def handle_requests(self, event: AstrMessageEvent):
-        """监听所有消息事件，处理好友申请和群邀请"""
-        raw = event.message_obj.raw_message
-        
-        # 检查是否为好友申请事件 (以OneBot v11为例)
-        if isinstance(raw, dict) and raw.get('request_type') == 'friend':
-            flag = raw.get('flag')
-            user_id = str(raw.get('user_id'))
-            comment = raw.get('comment', '')
-            
-            # 检查黑名单
-            if user_id in self.blacklist:
-                await self.call_platform_api("set_friend_add_request", flag=flag, approve=False)
-                logger.info(f"自动拒绝黑名单用户 {user_id} 的好友申请")
-                yield event.plain_result(f"🚫 已自动拒绝黑名单用户 {user_id} 的好友申请。")
-            else:
-                # 记录待处理申请（实际应存储到数据库或文件，并通知管理员）
-                self.pending_requests[flag] = {
-                    'type': 'friend',
-                    'user_id': user_id,
-                    'comment': comment,
-                    'time': event.time
-                }
-                # 通知管理员（这里简化为直接回复，实际应发送到指定通知群）
-                yield event.plain_result(f"📥 收到新好友申请:\n用户: {user_id}\n理由: {comment}\n请使用 /同意好友 {flag} 或 /拒绝好友 {flag} 处理")
+    async def on_friend_request(self, event: FriendRequestEvent):
+        """监听好友申请事件 - 黑名单用户自动拒绝"""
+        user_id = str(event.user_id)
+        flag = event.flag
+        comment = event.comment or ""
 
-        # 检查是否为群邀请事件 (以OneBot v11为例)
-        elif isinstance(raw, dict) and raw.get('request_type') == 'group':
-            flag = raw.get('flag')
-            group_id = str(raw.get('group_id'))
-            user_id = str(raw.get('user_id'))
-            sub_type = raw.get('sub_type')
-            comment = raw.get('comment', '')
-            
-            if sub_type == 'invite':
-                # 检查群黑名单（如果实现了）
-                # if group_id in self.group_blacklist: ...
-                
-                # 检查邀请人黑名单
-                if user_id in self.blacklist:
-                    await self.call_platform_api("set_group_add_request", flag=flag, approve=False, sub_type=sub_type)
-                    logger.info(f"自动拒绝黑名单用户 {user_id} 的群邀请")
-                    yield event.plain_result(f"🚫 已自动拒绝黑名单用户 {user_id} 的群邀请。")
-                else:
-                    self.pending_requests[flag] = {
-                        'type': 'group',
-                        'group_id': group_id,
-                        'user_id': user_id,
-                        'comment': comment,
-                        'time': event.time
-                    }
-                    yield event.plain_result(f"📥 收到新群邀请:\n群号: {group_id}\n邀请人: {user_id}\n理由: {comment}\n请使用 /同意群 {flag} 或 /拒绝群 {flag} 处理")
+        logger.info(f"收到好友申请: 用户 {user_id}, flag: {flag}, 理由: {comment}")
+
+        if self.is_blacklisted(user_id, "friend"):
+            await self.call_platform_api("set_friend_add_request", flag=flag, approve=False)
+            logger.info(f"🚫 已自动拒绝黑名单用户 {user_id} 的好友申请")
+            await self.send_notification(
+                f"🚫 已自动拒绝黑名单用户的好友申请\n"
+                f"用户: {user_id}\n"
+                f"申请理由: {comment}"
+            )
+            return
+
+        self.pending_requests[flag] = {
+            'type': 'friend',
+            'user_id': user_id,
+            'comment': comment,
+            'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        self.save_pending_requests()
+        
+        await self.send_notification(
+            f"📥 收到新好友申请:\n"
+            f"用户: {user_id}\n"
+            f"Flag: {flag}\n"
+            f"理由: {comment}\n"
+            f"处理: /同意 {flag} 或 /拒绝 {flag}"
+        )
+
+    async def on_group_request(self, event: GroupRequestEvent):
+        """监听群邀请事件 - 黑名单用户自动拒绝"""
+        flag = event.flag
+        group_id = str(event.group_id)
+        user_id = str(event.user_id)
+        sub_type = event.sub_type
+        comment = event.comment or ""
+
+        if sub_type != 'invite':
+            return
+
+        logger.info(f"收到群邀请: 群 {group_id}, 邀请人 {user_id}, flag: {flag}")
+
+        if self.is_blacklisted(user_id, "group_invite"):
+            await self.call_platform_api("set_group_add_request", flag=flag, approve=False, sub_type=sub_type)
+            logger.info(f"🚫 已自动拒绝黑名单用户 {user_id} 的群邀请")
+            await self.send_notification(
+                f"🚫 已自动拒绝黑名单用户的群邀请\n"
+                f"邀请人: {user_id}\n"
+                f"群号: {group_id}"
+            )
+            return
+
+        self.pending_requests[flag] = {
+            'type': 'group',
+            'group_id': group_id,
+            'user_id': user_id,
+            'sub_type': sub_type,
+            'comment': comment,
+            'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        self.save_pending_requests()
+        
+        await self.send_notification(
+            f"📥 收到新群邀请:\n"
+            f"群号: {group_id}\n"
+            f"邀请人: {user_id}\n"
+            f"Flag: {flag}\n"
+            f"理由: {comment}\n"
+            f"处理: /同意群 {flag} 或 /拒绝群 {flag}"
+        )
 
     async def terminate(self):
         """插件卸载时的清理工作"""
