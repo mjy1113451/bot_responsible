@@ -1,7 +1,8 @@
 import json
 import re
+import asyncio
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 from astrbot.api.event import filter, AstrMessageEvent
@@ -13,10 +14,18 @@ from astrbot.api import logger
     "astrbot_plugin_relationship_manager",
     "YourName",
     "AstrBot 关系管理插件",
-    "5.1.0",
+    "5.2.0",
     "https://github.com/your-repo/astrbot_plugin_relationship_manager",
 )
 class RelationshipManager(Star):
+
+    # OneBot v11 CQ 码
+    _CQ_REPLY_RE = re.compile(r"\[CQ:reply,id=(\d+)\]")
+    # OneBot v12 / 标准 reply 结构匹配
+    _MSG_ID_RE = re.compile(r'"message_id"\s*:\s*"?(\d+)"?')
+
+    # 待处理请求过期时间（天）
+    PENDING_TTL_DAYS = 7
 
     def __init__(self, context: Context):
         super().__init__(context)
@@ -34,7 +43,9 @@ class RelationshipManager(Star):
         self.pending: Dict[str, dict] = self._load(self.pd_file, {})
         self._migrate_blacklist()
 
-        self.notify_group: Optional[str] = None
+        self.notify_group: Optional[str] = config.get("notify_group", None)
+        self._lock = asyncio.Lock()
+        self._cleanup_pending()
 
     # ───────── 持久化 ─────────
 
@@ -57,18 +68,66 @@ class RelationshipManager(Star):
             logger.error(f"保存 {path.name} 失败: {e}")
 
     def _migrate_blacklist(self):
+        """
+        修复1: 重建字典代替就地修改，避免迭代时修改字典导致的跳跃问题
+        修复2: 同时迁移顶层 group_blacklist（如果它是 dict 而非嵌套在 group_blacklist key 下）
+        """
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         changed = False
-        for uid, val in list(self.blacklist.items()):
+
+        # 快照当前条目（包含 group_blacklist key 本身）
+        entries = list(self.blacklist.items())
+        new_blacklist: Dict[str, dict] = {}
+
+        for uid, val in entries:
+            # 跳过元数据 key
+            if uid == "group_blacklist":
+                # group_blacklist 如果是 dict（而不是 {"group_blacklist": {...}} 嵌套），
+                # 说明旧版格式没有外层包装，需要规范化
+                if isinstance(val, dict):
+                    new_blacklist[uid] = val
+                continue
+
             if isinstance(val, str):
-                self.blacklist[uid] = dict(
+                # 字符串 → 完整 dict
+                new_blacklist[uid] = dict(
                     time=now, block_msg=True, block_friend=True, block_group_invite=True
                 )
                 changed = True
-            elif isinstance(val, dict) and "reason" in val:
-                val.pop("reason", None)
+            elif isinstance(val, dict):
+                # dict 中移除废弃的 reason 字段
+                if "reason" in val:
+                    val.pop("reason")
+                    changed = True
+                new_blacklist[uid] = val
+            else:
+                new_blacklist[uid] = val
+
+        # 检查顶层是否有游离的 group_blacklist entry（修复2）
+        # 如果某个 key 的值是群号字符串，迁入 group_blacklist
+        to_migrate_groups: Dict[str, dict] = {}
+        for uid, val in list(entries):
+            if uid == "group_blacklist":
+                continue
+            # 旧版可能把群号直接放在顶层，格式是 {"123456": "group"} 或 {"123456": {"time": "..."}}
+            if isinstance(val, str) and self._valid_gid(uid):
+                to_migrate_groups[uid] = {"time": now, "source": "migrated"}
                 changed = True
+            elif isinstance(val, dict) and "group_name" in val and self._valid_gid(uid):
+# 看起来是群条目，不是用户
+                to_migrate_groups[uid] = {"time": val.get("time", now), "source": "migrated"}
+                changed = True
+
+        if to_migrate_groups:
+            existing = new_blacklist.get("group_blacklist", {})
+            for gid, ginfo in to_migrate_groups.items():
+                if gid not in existing:
+                    existing[gid] = ginfo
+            new_blacklist["group_blacklist"] = existing
+            changed = True
+
         if changed:
+            self.blacklist = new_blacklist
             self._save(self.bl_file, self.blacklist)
 
     # ───────── 工具 ─────────
@@ -105,9 +164,18 @@ class RelationshipManager(Star):
 
     @staticmethod
     def _ids(text: str) -> List[str]:
-        return re.findall(r"\d+", text)
+        return re.findall(r"\b(\d{5,12})\b", text)
+
+    @classmethod
+    def _valid_uid(cls, uid: str) -> bool:
+        return bool(re.fullmatch(r"\d{5,12}", uid))
+
+    @classmethod
+    def _valid_gid(cls, gid: str) -> bool:
+        return bool(re.fullmatch(r"\d{5,12}", gid))
 
     def _get_admins(self) -> List[str]:
+        """修复8: 移除冗余 return []，重构异常处理"""
         try:
             if hasattr(self.context, "get_admin_list"):
                 return [str(a) for a in self.context.get_admin_list()]
@@ -117,19 +185,28 @@ class RelationshipManager(Star):
             for key in ["admins", "admin_users", "admin_list"]:
                 if key in config:
                     return [str(a) for a in config[key]]
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"获取管理员列表异常: {e}")
         return []
 
-    def _add_to_blacklist(self, uid: str):
-        """将用户加入黑名单，屏蔽所有"""
+    async def _add_to_blacklist(self, uid: str):
+        """
+        修复3: 添加锁保护，确保线程/协程安全
+        """
         if not uid:
             return
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.blacklist[uid] = dict(
-            time=now, block_msg=True, block_friend=True, block_group_invite=True
-        )
-        self._save(self.bl_file, self.blacklist)
+        async with self._lock:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if uid in self.blacklist and isinstance(self.blacklist[uid], dict):
+                self.blacklist[uid]["time"] = now
+                self.blacklist[uid]["block_msg"] = True
+                self.blacklist[uid]["block_friend"] = True
+                self.blacklist[uid]["block_group_invite"] = True
+            else:
+                self.blacklist[uid] = dict(
+                    time=now, block_msg=True, block_friend=True, block_group_invite=True
+                )
+            self._save(self.bl_file, self.blacklist)
 
     async def _api(self, name: str, **kw) -> Optional[dict]:
         try:
@@ -142,11 +219,8 @@ class RelationshipManager(Star):
         return None
 
     async def _notify(self, msg: str):
-        if self.notify_group:
-            await self._api("send_group_msg", group_id=int(self.notify_group), message=msg)
-        else:
-            for aid in self._get_admins():
-                await self._api("send_private_msg", user_id=int(aid), message=msg)
+"""修复7: 委托给 _notify_with_ids，忽略返回值"""
+        await self._notify_with_ids(msg)
 
     async def _notify_with_ids(self, msg: str) -> List[str]:
         ids = []
@@ -166,15 +240,30 @@ class RelationshipManager(Star):
         return ids
 
     def _get_reply_id(self, event: AstrMessageEvent) -> Optional[str]:
+        """
+        修复5: 兼容 dict 形式的 CQ 码（OneBot 某些实现 message 元素是 dict 而非对象）
+        """
         try:
             for comp in event.message_obj.message:
+                # 对象形式（有 type 属性）
                 if hasattr(comp, "type") and comp.type == "reply":
-                    return str(comp.data.get("id", ""))
+                    return str(comp.data.get("id", "") if hasattr(comp, "data") else "")
+                # dict 形式
+                if isinstance(comp, dict):
+                    if comp.get("type") == "reply":
+                        return str(comp.get("data", {}).get("id", ""))
         except Exception:
             pass
         try:
             raw_str = str(event.message_obj.raw_message)
-            match = re.search(r"\[CQ:reply,id=(\d+)\]", raw_str)
+            match = self._CQ_REPLY_RE.search(raw_str)
+            if match:
+                return match.group(1)
+        except Exception:
+            pass
+        try:
+            raw_str = str(event.message_obj.raw_message)
+            match = self._MSG_ID_RE.search(raw_str)
             if match:
                 return match.group(1)
         except Exception:
@@ -189,24 +278,60 @@ class RelationshipManager(Star):
                 return flag
         return None
 
+    def _cleanup_pending(self):
+        now = datetime.now()
+        expired = []
+        for flag, info in self.pending.items():
+            try:
+                t = datetime.strptime(info.get("time", ""), "%Y-%m-%d %H:%M:%S")
+                if now - t > timedelta(days=self.PENDING_TTL_DAYS):
+                    expired.append(flag)
+            except (ValueError, TypeError):
+                expired.append(flag)
+        if expired:
+            for flag in expired:
+                self.pending.pop(flag, None)
+            self._save(self.pd_file, self.pending)
+            logger.info(f"已清理 {len(expired)} 条过期待处理请求")
+
+    # ───────── 群黑名单管理 ─────────
+
+    def _add_group_to_blacklist(self, gid: str):
+        if not gid:
+            return
+        group_bl_key = "group_blacklist"
+        group_blacklist = self.blacklist.get(group_bl_key, {})
+        if str(gid) not in group_blacklist:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            group_blacklist[str(gid)] = {"time": now}
+            self.blacklist[group_bl_key] = group_blacklist
+            self._save(self.bl_file, self.blacklist)
+            logger.info(f"群 {gid} 已加入黑名单")
+
+    def _is_group_blocked(self, gid: str) -> bool:
+        if not gid:
+            return False
+        group_bl_key = "group_blacklist"
+        group_blacklist = self.blacklist.get(group_bl_key, {})
+        return str(gid) in group_blacklist
+
     # ───────── 请求事件自动监听 ─────────
 
+    @filter.on_event()
     async def handle_event(self, event: AstrMessageEvent) -> Optional[AstrMessageEvent]:
-        # 优先处理请求事件（好友申请/群邀请），不受消息屏蔽影响
         try:
             raw = event.message_obj.raw_message
             if isinstance(raw, dict):
                 req_type = raw.get("request_type")
                 if req_type == "friend":
-                    await self._on_friend_req(raw)
+await self._on_friend_req(raw)
                     return None
                 elif req_type == "group" and raw.get("sub_type") == "invite":
                     await self._on_group_invite(raw)
                     return None
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"处理请求事件异常: {e}")
 
-        # 普通消息：检查消息屏蔽
         try:
             uid = str(event.get_sender_id())
             if uid and self._blocked(uid, "msg"):
@@ -220,31 +345,52 @@ class RelationshipManager(Star):
         uid = str(raw.get("user_id", ""))
         flag = str(raw.get("flag", ""))
         comment = raw.get("comment", "") or ""
+
         if not uid or not flag:
             return
 
-        # 黑名单自动拒绝（检查 block_friend）
-        if self._blocked(uid, "friend"):
-            await self._api("set_friend_add_request", flag=flag, approve=False)
-            await self._notify(f"🚫 自动拒绝黑名单好友申请\n用户: {uid}")
+        if not self._valid_uid(uid):
+            logger.warning(f"好友申请 uid 格式异常，已忽略: {uid}")
             return
 
-        self.pending[flag] = dict(
-            type="friend", user_id=uid, comment=comment,
-            time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            notify_ids=[],
-        )
-        self._save(self.pd_file, self.pending)
+        if self._blocked(uid, "friend"):
+            await self._api("set_friend_add_request", flag=flag, approve=False)
+            await self._notify(f"🚫 自动拒绝黑名单好友申请\nQQ号: {uid}")
+            return
 
-        msg_ids = await self._notify_with_ids(
-            f"📥 新好友申请\n用户: {uid}\n理由: {comment}\n"
-            f"💬 引用此消息回复: /同意 或 /拒绝 或 /拉黑审批"
-        )
-        if msg_ids:
-            self.pending[flag]["notify_ids"] = msg_ids
+        nickname = uid
+        try:
+            info_res = await self._api("get_stranger_info", user_id=int(uid))
+            if info_res and info_res.get("status") == "ok":
+                nickname = info_res.get("data", {}).get("nickname", uid)
+        except Exception:
+            pass
+
+        async with self._lock:
+            self.pending[flag] = dict(
+                type="friend", user_id=uid, nickname=nickname, comment=comment,
+                time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                notify_ids=[],
+            )
             self._save(self.pd_file, self.pending)
 
+        msg_ids = await self._notify_with_ids(
+            f"【好友申请】同意/拒绝/拉黑：\n"
+            f"昵称：{nickname}\n"
+            f"QQ号：{uid}\n"
+            f"验证信息：{comment if comment else '无'}\n"
+            f"💬 引用此消息回复: /同意 或 /拒绝 或 /拉黑"
+        )
+        if msg_ids:
+            async with self._lock:
+                self.pending[flag]["notify_ids"] = msg_ids
+                self._save(self.pd_file, self.pending)
+
     async def _on_group_invite(self, raw: dict):
+        """
+        修复4: uid="0"（机器人主动申请加群）场景单独处理，
+        走 group_blacklist 校验而非 user blacklist
+        """
         uid = str(raw.get("user_id", ""))
         gid = str(raw.get("group_id", ""))
         flag = str(raw.get("flag", ""))
@@ -253,26 +399,121 @@ class RelationshipManager(Star):
         if not flag:
             return
 
-        # 黑名单自动拒绝（检查 block_group_invite）
-        if self._blocked(uid, "group_invite"):
+        if uid and not self._valid_uid(uid):
+            logger.warning(f"群邀请 uid 格式异常，已忽略: {uid}")
+            return
+        if gid and not self._valid_gid(gid):
+            logger.warning(f"群邀请 gid 格式异常，已忽略: {gid}")
+            return
+
+        # uid="0" 表示机器人主动申请加群，跳过用户黑名单校验，只走群黑名单
+        if uid and uid != "0" and self._blocked(uid, "group_invite"):
             await self._api("set_group_add_request", flag=flag, approve=False, sub_type=sub)
             await self._notify(f"🚫 自动拒绝黑名单群邀请\n邀请人: {uid}\n群号: {gid}")
             return
 
-        self.pending[flag] = dict(
-            type="group", group_id=gid, user_id=uid, sub_type=sub, comment=comment,
-            time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            notify_ids=[],
-        )
-        self._save(self.pd_file, self.pending)
+        if self._is_group_blocked(gid):
+            res = await self._api("set_group_add_request", flag=flag, approve=False, sub_type=sub)
+            if not res or res.get("retcode") != 0:
+                logger.warning(f"无法拒绝黑名单群 {gid} 的邀请（可能已被拉入），等待进群后处理")
+            else:
+                await self._notify(
+                    f"🚫 自动拒绝黑名单群邀请\n群号: {gid}\n"
+                    f"⚠️ 该群曾将Bot踢出，已自动拒绝邀请"
+                )
+                return
+
+        inviter_nickname = uid if uid != "0" else "（机器人主动申请）"
+        if uid and uid != "0":
+            try:
+                info_res = await self._api("get_stranger_info", user_id=int(uid))
+                if info_res and info_res.get("status") == "ok":
+                    inviter_nickname = info_res.get("data", {}).get("nickname", uid)
+            except Exception:
+                pass
+
+        group_name = gid
+        try:
+            group_res = await self._api("get_group_info", group_id=int(gid))
+if group_res and group_res.get("status") == "ok":
+                group_name = group_res.get("data", {}).get("group_name", gid)
+        except Exception:
+            pass
+
+        async with self._lock:
+            self.pending[flag] = dict(
+                type="group", group_id=gid, group_name=group_name,
+                user_id=uid, inviter_nickname=inviter_nickname,
+                sub_type=sub, comment=comment,
+                time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                notify_ids=[],
+            )
+            self._save(self.pd_file, self.pending)
 
         msg_ids = await self._notify_with_ids(
-            f"📥 新群邀请\n群号: {gid}\n邀请人: {uid}\n理由: {comment}\n"
-            f"💬 引用此消息回复: /同意 或 /拒绝 或 /拉黑审批"
+            f"【群邀请】同意/拒绝/拉黑：\n"
+            f"邀请人昵称：{inviter_nickname}\n"
+            f"邀请人QQ：{uid}\n"
+            f"群名称：{group_name}\n"
+            f"群号：{gid}\n"
+            f"验证信息：{comment if comment else '无'}\n"
+            f"💬 引用此消息回复: /同意 或 /拒绝 或 /拉黑"
         )
         if msg_ids:
-            self.pending[flag]["notify_ids"] = msg_ids
-            self._save(self.pd_file, self.pending)
+            async with self._lock:
+                self.pending[flag]["notify_ids"] = msg_ids
+                self._save(self.pd_file, self.pending)
+
+    # ───────── 通知事件监听（被踢 / 进群）─────────
+
+    @filter.on_notice()
+    async def handle_notice(self, event: AstrMessageEvent):
+        """
+        修复9: asyncio.sleep(2) 包装在 try/except 中，防止 notice_type 不匹配时异常泄漏
+        """
+        try:
+            raw = event.message_obj.raw_message
+            if isinstance(raw, dict):
+                notice_type = raw.get("notice_type")
+                group_id = str(raw.get("group_id", ""))
+                user_id = str(raw.get("user_id", ""))
+                operator_id = str(raw.get("operator_id", ""))
+                self_id = str(event.get_self_id())
+
+                if notice_type == "group_decrease":
+                    sub_type = raw.get("sub_type", "")
+                    if sub_type in ("kick", "kick_me") and user_id == self_id:
+                        if group_id:
+                            self._add_group_to_blacklist(group_id)
+                            logger.info(f"Bot被踢出群 {group_id}，已将该群加入黑名单")
+                            await self._notify(
+                                f"⚠️ Bot被踢出群 {group_id}\n"
+                                f"操作者: {operator_id}\n"
+                                f"该群已加入黑名单，后续邀请将被自动拒绝"
+                            )
+
+                elif notice_type == "group_increase":
+                    sub_type = raw.get("sub_type", "")
+                    if user_id == self_id and group_id:
+                        if self._is_group_blocked(group_id):
+                            try:
+                                await self._api(
+                                    "send_group_msg",
+                                    group_id=int(group_id),
+                                    message="别老是让我进来又给我踢出去，烦不烦啊？！"
+                                )
+                                await asyncio.sleep(2)
+                                await self._api("set_group_leave", group_id=int(group_id))
+                            except Exception as notify_err:
+                                logger.error(f"黑名单群 {group_id} 退群异常: {notify_err}")
+                            logger.info(f"已自动退出黑名单群 {group_id}")
+                            await self._notify(
+                                f"🚫 Bot被拉入黑名单群 {group_id}\n"
+                                f"已发送提示并自动退出该群"
+                            )
+
+        except Exception as e:
+            logger.error(f"处理通知事件异常: {e}")
 
     # ───────── 查看列表 ─────────
 
@@ -291,7 +532,7 @@ class RelationshipManager(Star):
 
         friends = res.get("data", [])
         if not friends:
-            yield event.plain_result("📋 没有好友")
+yield event.plain_result("📋 没有好友")
             return
 
         lines = ["📋 好友列表"]
@@ -322,7 +563,9 @@ class RelationshipManager(Star):
 
         lines = ["📋 群列表"]
         for i, g in enumerate(groups, 1):
-            lines.append(f"{i}. {g.get('group_name', '?')} ({g.get('group_id', '?')})")
+            gid = g.get('group_id', '?')
+            tag = " 🚫" if self._is_group_blocked(str(gid)) else ""
+            lines.append(f"{i}. {g.get('group_name', '?')} ({gid}){tag}")
 
         yield event.plain_result("\n".join(lines))
 
@@ -338,20 +581,33 @@ class RelationshipManager(Star):
 
         uids = self._ids(args)
         if not uids:
-            yield event.plain_result("⚠️ /拉黑 123 [456] ...  或引用通知消息回复 /拉黑审批")
+            yield event.plain_result("⚠️ /拉黑 12345 [67890] ...  或引用通知消息回复 /拉黑")
             return
 
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        added, dup = [], []
+        valid, invalid = [], []
         for u in uids:
-            if u in self.blacklist:
-                dup.append(u)
+            if self._valid_uid(u):
+                valid.append(u)
             else:
-                self.blacklist[u] = dict(
-                    time=now, block_msg=True, block_friend=True, block_group_invite=True
-                )
-                added.append(u)
-        self._save(self.bl_file, self.blacklist)
+                invalid.append(u)
+
+        if invalid:
+            yield event.plain_result(f"⚠️ 格式无效（需5-12位数字）: {', '.join(invalid)}")
+            if not valid:
+                return
+
+        async with self._lock:
+            added, dup = [], []
+            for u in valid:
+                if u in self.blacklist:
+                    dup.append(u)
+                else:
+                    self.blacklist[u] = dict(
+                        time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        block_msg=True, block_friend=True, block_group_invite=True,
+                    )
+                    added.append(u)
+            self._save(self.bl_file, self.blacklist)
 
         parts = []
         if added:
@@ -370,17 +626,18 @@ class RelationshipManager(Star):
 
         uids = self._ids(args)
         if not uids:
-            yield event.plain_result("⚠️ /解封 123 [456] ...")
+            yield event.plain_result("⚠️ /解封 12345 [67890] ...")
             return
 
-        removed, miss = [], []
-        for u in uids:
-            if u in self.blacklist:
-                del self.blacklist[u]
-                removed.append(u)
-            else:
-                miss.append(u)
-        self._save(self.bl_file, self.blacklist)
+        async with self._lock:
+            removed, miss = [], []
+            for u in uids:
+                if u in self.blacklist:
+                    del self.blacklist[u]
+                    removed.append(u)
+                else:
+                    miss.append(u)
+            self._save(self.bl_file, self.blacklist)
 
         parts = []
         if removed:
@@ -395,7 +652,7 @@ class RelationshipManager(Star):
             return
         if not self._is_admin(event):
             yield event.plain_result("❌ 仅管理员可用")
-            return
+return
 
         if not self.blacklist:
             yield event.plain_result("📋 黑名单为空")
@@ -403,6 +660,13 @@ class RelationshipManager(Star):
 
         lines = [f"🚫 黑名单 ({len(self.blacklist)} 人)"]
         for uid, info in self.blacklist.items():
+            if uid == "group_blacklist":
+                group_bl = info
+                for gid, g_info in group_bl.items():
+                    t = g_info.get("time", "?")
+                    lines.append(f"- 群 {gid} | 加入黑名单时间: {t}")
+                continue
+
             m = "✅" if info.get("block_msg", True) else "❌"
             fr = "✅" if info.get("block_friend", True) else "❌"
             gi = "✅" if info.get("block_group_invite", True) else "❌"
@@ -420,20 +684,29 @@ class RelationshipManager(Star):
             yield event.plain_result("❌ 仅管理员可用")
             return
 
-        if not self.pending:
+        async with self._lock:
+            self._cleanup_pending()
+            pending_snapshot = dict(self.pending)
+
+        if not pending_snapshot:
             yield event.plain_result("📋 无待处理请求")
             return
 
-        lines = ["📋 待处理请求（引用对应消息回复 /同意 或 /拒绝 或 /拉黑审批）"]
-        for flag, info in self.pending.items():
+        lines = ["📋 待处理请求（引用对应消息回复 /同意 或 /拒绝 或 /拉黑）"]
+        for flag, info in pending_snapshot.items():
             t = info.get("time", "?")
             if info["type"] == "friend":
+                nickname = info.get('nickname', info['user_id'])
+                comment = info.get('comment') or '无'
                 lines.append(
-                    f"🔹 好友 | 用户:{info['user_id']} | 理由:{info.get('comment', '无')} | {t}"
+                    f"🔹 好友 | 昵称:{nickname} QQ:{info['user_id']} | 验证:{comment} | {t}"
                 )
             else:
+                inviter_nickname = info.get('inviter_nickname', info['user_id'])
+                group_name = info.get('group_name', info['group_id'])
+                comment = info.get('comment') or '无'
                 lines.append(
-                    f"🔸 群邀 | 群:{info['group_id']} | 邀请人:{info['user_id']} | {t}"
+                    f"🔸 群邀 | 群:{group_name}({info['group_id']}) | 邀请人:{inviter_nickname}({info['user_id']}) | 验证:{comment} | {t}"
                 )
 
         yield event.plain_result("\n".join(lines))
@@ -455,6 +728,9 @@ class RelationshipManager(Star):
             return
 
         uid = uids[0]
+        if not self._valid_uid(uid):
+            yield event.plain_result(f"⚠️ QQ号格式无效（需5-12位数字）: {uid}")
+            return
         comment = parts[1] if len(parts) > 1 else ""
 
         res = await self._api("send_friend_add_request", user_id=int(uid), comment=comment)
@@ -463,12 +739,13 @@ class RelationshipManager(Star):
             yield event.plain_result(f"✅ 已发送好友申请\n用户: {uid}\n备注: {comment or '无'}")
         else:
             flag = f"fr_{uid}_{int(datetime.now().timestamp())}"
-            self.pending[flag] = dict(
-                type="friend", user_id=uid, comment=comment,
-                time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                notify_ids=[],
-            )
-            self._save(self.pd_file, self.pending)
+            async with self._lock:
+                self.pending[flag] = dict(
+                    type="friend", user_id=uid, comment=comment,
+                    time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    notify_ids=[],
+                )
+                self._save(self.pd_file, self.pending)
             yield event.plain_result(
                 f"⚠️ 发送好友申请失败，已记录到待处理\n用户: {uid}"
             )
@@ -483,10 +760,20 @@ class RelationshipManager(Star):
 
         nums = self._ids(args)
         if not nums:
-            yield event.plain_result("⚠️ /加群 群号")
+yield event.plain_result("⚠️ /加群 群号")
             return
 
         gid = nums[0]
+        if not self._valid_gid(gid):
+            yield event.plain_result(f"⚠️ 群号格式无效（需5-12位数字）: {gid}")
+            return
+
+        if self._is_group_blocked(gid):
+            yield event.plain_result(
+                f"⚠️ 群 {gid} 在黑名单中，无法加入\n"
+                f"该群曾将Bot踢出，如需加入请先使用 /解封群 命令"
+            )
+            return
 
         res = await self._api("send_group_add_request", group_id=int(gid))
 
@@ -494,12 +781,13 @@ class RelationshipManager(Star):
             yield event.plain_result(f"✅ 已发送加群申请\n群号: {gid}")
         else:
             flag = f"gi_{gid}_{int(datetime.now().timestamp())}"
-            self.pending[flag] = dict(
-                type="group", group_id=gid, user_id="0", sub_type="add",
-                comment="主动加群",
-                time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                notify_ids=[],
-            )
+            async with self._lock:
+                self.pending[flag] = dict(
+                    type="group", group_id=gid, user_id="0", sub_type="add",
+                    comment="主动加群",
+                    time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    notify_ids=[],
+                )
             self._save(self.pd_file, self.pending)
             yield event.plain_result(
                 f"⚠️ 加群失败，已记录到待处理\n群号: {gid}"
@@ -517,7 +805,7 @@ class RelationshipManager(Star):
 
         uids = self._ids(args)
         if not uids:
-            yield event.plain_result("⚠️ /删好友 123 [456] ...")
+            yield event.plain_result("⚠️ /删好友 12345 [67890] ...")
             return
 
         ok, fail = [], []
@@ -542,7 +830,7 @@ class RelationshipManager(Star):
 
         gids = self._ids(args)
         if not gids:
-            yield event.plain_result("⚠️ /退群 111 [222] ...")
+            yield event.plain_result("⚠️ /退群 111222 [333444] ...")
             return
 
         ok, fail = [], []
@@ -560,23 +848,17 @@ class RelationshipManager(Star):
     # ───────── 同意 / 拒绝 / 拉黑（统一审批）─────────
 
     async def _process_reply(self, event: AstrMessageEvent, action: str):
-        """
-        通过引用消息统一审批
-        action: "accept" | "reject" | "block"
-        """
         if self._sender_blocked(event):
             return
         if not self._is_admin(event):
             yield event.plain_result("❌ 仅管理员可用")
             return
 
-        # 必须引用消息
         reply_id = self._get_reply_id(event)
         if not reply_id:
-            yield event.plain_result("⚠️ 请引用通知消息回复 /同意 或 /拒绝 或 /拉黑审批")
+            yield event.plain_result("⚠️ 请引用通知消息回复 /同意 或 /拒绝 或 /拉黑")
             return
 
-        # 查找对应的 flag
         flag = self._find_flag_by_msg_id(reply_id)
         if not flag:
             yield event.plain_result("❌ 该引用消息未匹配到待处理请求")
@@ -590,32 +872,28 @@ class RelationshipManager(Star):
         uid = info.get("user_id", "")
         kind = "好友申请" if info["type"] == "friend" else "群邀请"
         if info["type"] == "friend":
-            target = f"用户 {uid}"
+            nickname = info.get("nickname", uid)
+            target = f"昵称：{nickname}\nQQ号：{uid}"
         else:
-            target = f"群 {info['group_id']} (邀请人: {uid})"
-
-        # ── 拉黑模式：拒绝请求 + 加入黑名单 ──
-        if action == "block":
-            # 1. 拒绝当前请求
+                   if action == "block":
             try:
                 if info["type"] == "friend":
-                    await self._api("set_friend_add_request", flag=flag, approve=False)
+await self._api("set_friend_add_request", flag=flag, approve=False)
                 else:
                     await self._api(
-                        "set_group_add_request",
-                        flag=flag, approve=False,
+                        "set_group_add_request", flag=flag, approve=False,
                         sub_type=info.get("sub_type", "invite"),
                     )
             except Exception as e:
                 logger.error(f"拒绝 {flag} 异常: {e}")
 
-            # 2. 加入黑名单（屏蔽消息+好友+群邀请），且确保 uid 有效
+            # 修复3: _add_to_blacklist 现在是 async，加 await
             if uid and uid != "0":
-                self._add_to_blacklist(uid)
+                await self._add_to_blacklist(uid)
 
-            # 3. 从待处理移除
-            self.pending.pop(flag, None)
-            self._save(self.pd_file, self.pending)
+            async with self._lock:
+                self.pending.pop(flag, None)
+                self._save(self.pd_file, self.pending)
 
             yield event.plain_result(
                 f"🚫 已拒绝{kind}并拉黑\n{target}\n"
@@ -623,21 +901,20 @@ class RelationshipManager(Star):
             )
             return
 
-        # ── 同意 / 拒绝模式 ──
         approve = (action == "accept")
         try:
             if info["type"] == "friend":
                 r = await self._api("set_friend_add_request", flag=flag, approve=approve)
             else:
                 r = await self._api(
-                    "set_group_add_request",
-                    flag=flag, approve=approve,
+                    "set_group_add_request", flag=flag, approve=approve,
                     sub_type=info.get("sub_type", "invite"),
                 )
 
             if r and r.get("status") == "ok":
-                self.pending.pop(flag, None)
-                self._save(self.pd_file, self.pending)
+                async with self._lock:
+                    self.pending.pop(flag, None)
+                    self._save(self.pd_file, self.pending)
 
                 act_text = "同意" if approve else "拒绝"
                 yield event.plain_result(f"✅ 已{act_text}{kind}\n{target}")
@@ -649,23 +926,147 @@ class RelationshipManager(Star):
 
     @filter.command("同意", alias=["accept"])
     async def cmd_accept(self, event: AstrMessageEvent):
-        """引用通知消息回复 /同意"""
         async for result in self._process_reply(event, action="accept"):
             yield result
 
     @filter.command("拒绝", alias=["reject"])
     async def cmd_reject(self, event: AstrMessageEvent):
-        """引用通知消息回复 /拒绝"""
         async for result in self._process_reply(event, action="reject"):
             yield result
 
-    @filter.command("拉黑审批", alias=["blockreply"])
+    @filter.command("拉黑", alias=["blockreply"])
     async def cmd_block_reply(self, event: AstrMessageEvent):
-        """引用通知消息回复 /拉黑审批，拒绝并拉黑该用户"""
         async for result in self._process_reply(event, action="block"):
             yield result
+
+    # ───────── 群黑名单管理命令 ─────────
+
+    @filter.command("拉黑群", alias=["addblg"])
+    async def cmd_bl_add_group(self, event: AstrMessageEvent, args: str = ""):
+        if self._sender_blocked(event):
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 仅管理员可用")
+            return
+
+        gids = self._ids(args)
+        if not gids:
+            yield event.plain_result("⚠️ /拉黑群 群号1 [群号2] ...")
+            return
+
+        valid, invalid = [], []
+        for g in gids:
+            if self._valid_gid(g):
+                valid.append(g)
+            else:
+                invalid.append(g)
+
+        if invalid:
+            yield event.plain_result(f"⚠️ 群号格式无效（需5-12位数字）: {', '.join(invalid)}")
+            if not valid:
+                return
+
+        async with self._lock:
+            group_bl_key = "group_blacklist"
+            group_blacklist = self.blacklist.get(group_bl_key, {})
+            added, dup = [], []
+
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for g in valid:
+                if str(g) in group_blacklist:
+                    dup.append(g)
+                else:
+                    group_blacklist[str(g)] = {"time": now}
+                    added.append(g)
+
+            self.blacklist[group_bl_key] = group_blacklist
+            self._save(self.bl_file, self.blacklist)
+
+        parts = []
+        if added:
+            parts.append(f"✅ 已拉黑 {len(added)} 个群: {', '.join(added)}")
+        if dup:
+            parts.append(f"⚠️ 已存在: {', '.join(dup)}")
+        yield event.plain_result("\n".join(parts))
+
+@filter.command("解封群", alias=["rmblg"])
+    async def cmd_bl_rm_group(self, event: AstrMessageEvent, args: str = ""):
+        if self._sender_blocked(event):
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 仅管理员可用")
+            return
+
+        gids = self._ids(args)
+        if not gids:
+            yield event.plain_result("⚠️ /解封群 群号1 [群号2] ...")
+            return
+
+        async with self._lock:
+            group_bl_key = "group_blacklist"
+            group_blacklist = self.blacklist.get(group_bl_key, {})
+            removed, miss = [], []
+
+            for g in gids:
+                if str(g) in group_blacklist:
+                    del group_blacklist[str(g)]
+                    removed.append(g)
+                else:
+                    miss.append(g)
+
+            self.blacklist[group_bl_key] = group_blacklist
+            self._save(self.bl_file, self.blacklist)
+
+        parts = []
+        if removed:
+            parts.append(f"✅ 已解封 {len(removed)} 个群: {', '.join(removed)}")
+        if miss:
+            parts.append(f"⚠️ 不存在: {', '.join(miss)}")
+        yield event.plain_result("\n".join(parts))
+
+    # ───────── 通知群设置 ─────────
+
+    @filter.command("通知群", alias=["setnotify", "setgroup"])
+    async def cmd_set_notify_group(self, event: AstrMessageEvent, args: str = ""):
+        if self._sender_blocked(event):
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 仅管理员可用")
+            return
+
+        arg = args.strip()
+        if not arg or arg == "查看":
+            if self.notify_group:
+                yield event.plain_result(f"📢 当前通知群: {self.notify_group}")
+            else:
+                yield event.plain_result("📢 当前未设置通知群（通知发送给管理员私聊）")
+            return
+
+        if arg in ("取消", "清空", "关闭", "none", "null", "off"):
+            self.notify_group = None
+            config = self.context.get_config()
+            config["notify_group"] = None
+            self.context.set_config(config)
+            yield event.plain_result("✅ 已取消通知群，通知将发送给管理员私聊")
+            return
+
+        gids = self._ids(arg)
+        if not gids:
+            yield event.plain_result("⚠️ /通知群 123456  或  /通知群 取消")
+            return
+
+        gid = gids[0]
+        if not self._valid_gid(gid):
+            yield event.plain_result(f"⚠️ 群号格式无效（需5-12位数字）: {gid}")
+            return
+
+        self.notify_group = gid
+        config = self.context.get_config()
+        config["notify_group"] = gid
+        self.context.set_config(config)
+        yield event.plain_result(f"✅ 通知群已设置为: {gid}\n后续好友申请和群邀请通知将发送到该群")
 
     # ───────── 生命周期 ─────────
 
     async def terminate(self):
-        logger.info("关系管理插件已停止")
+        logger.info("关系管理插件已停止"）
