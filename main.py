@@ -195,12 +195,25 @@ class RelationshipManager(Star):
                 )
             self._save(self.bl_file, self.blacklist)
 
-    async def _api(self, name: str, **kw) -> Optional[dict]:
+    async def _api(self, name: str, event: AstrMessageEvent = None, **kw) -> Optional[dict]:
+        """调用 OneBot API"""
         try:
-            if hasattr(self.context, "call_api"):
-                return await self.context.call_api(name, **kw)
-            if hasattr(self, "call_api"):
-                return await self.call_api(name, **kw)
+            # 通过事件获取平台客户端
+            if event:
+                platform_id = event.get_platform_id()
+                platform = self.context.get_platform_inst(platform_id)
+                if platform:
+                    client = platform.get_client()
+                    if client and hasattr(client, name):
+                        return await getattr(client, name)(**kw)
+
+            # 遍历所有平台查找支持的客户端
+            for platform in self.context.platform_manager.get_insts():
+                if hasattr(platform, 'get_client'):
+                    client = platform.get_client()
+                    if client and hasattr(client, name):
+                        return await getattr(client, name)(**kw)
+
         except Exception as e:
             logger.error(f"API {name} 失败: {e}")
         return None
@@ -210,20 +223,23 @@ class RelationshipManager(Star):
         await self._notify_with_ids(msg)
 
     async def _notify_with_ids(self, msg: str) -> List[str]:
+        """发送通知消息"""
         ids = []
-        if self.notify_group:
-            res = await self._api("send_group_msg", group_id=int(self.notify_group), message=msg)
-            if res and isinstance(res, dict):
-                mid = res.get("data", {}).get("message_id")
-                if mid:
-                    ids.append(str(mid))
-        else:
-            for aid in self._get_admins():
-                res = await self._api("send_private_msg", user_id=int(aid), message=msg)
-                if res and isinstance(res, dict):
-                    mid = res.get("data", {}).get("message_id")
-                    if mid:
-                        ids.append(str(mid))
+        try:
+            from astrbot.api.message_components import Plain
+            message_chain = [Plain(text=msg)]
+
+            if self.notify_group:
+                # 发送到通知群
+                session = f"aiocqhttp:GroupMessage:{self.notify_group}"
+                await self.context.send_message(session, message_chain)
+            else:
+                # 发送给所有管理员
+                for aid in self._get_admins():
+                    session = f"aiocqhttp:FriendMessage:{aid}"
+                    await self.context.send_message(session, message_chain)
+        except Exception as e:
+            logger.error(f"发送通知失败: {e}")
         return ids
 
     def _get_reply_id(self, event: AstrMessageEvent) -> Optional[str]:
@@ -311,10 +327,10 @@ class RelationshipManager(Star):
             if isinstance(raw, dict):
                 req_type = raw.get("request_type")
                 if req_type == "friend":
-                    await self._on_friend_req(raw)
+                    await self._on_friend_req(raw, event)
                     return None
                 elif req_type == "group" and raw.get("sub_type") == "invite":
-                    await self._on_group_invite(raw)
+                    await self._on_group_invite(raw, event)
                     return None
         except Exception as e:
             logger.error(f"处理请求事件异常: {e}")
@@ -328,7 +344,7 @@ class RelationshipManager(Star):
 
         return event
 
-    async def _on_friend_req(self, raw: dict):
+    async def _on_friend_req(self, raw: dict, event: AstrMessageEvent = None):
         uid = str(raw.get("user_id", ""))
         flag = str(raw.get("flag", ""))
         comment = raw.get("comment", "") or ""
@@ -341,13 +357,13 @@ class RelationshipManager(Star):
             return
 
         if self._blocked(uid, "friend"):
-            await self._api("set_friend_add_request", flag=flag, approve=False)
+            await self._api("set_friend_add_request", event=event, flag=flag, approve=False)
             await self._notify(f"🚫 自动拒绝黑名单好友申请\nQQ号: {uid}")
             return
 
         nickname = uid
         try:
-            info_res = await self._api("get_stranger_info", user_id=int(uid))
+            info_res = await self._api("get_stranger_info", event=event, user_id=int(uid))
             if info_res and info_res.get("status") == "ok":
                 nickname = info_res.get("data", {}).get("nickname", uid)
         except Exception:
@@ -373,7 +389,7 @@ class RelationshipManager(Star):
                 self.pending[flag]["notify_ids"] = msg_ids
                 self._save(self.pd_file, self.pending)
 
-    async def _on_group_invite(self, raw: dict):
+    async def _on_group_invite(self, raw: dict, event: AstrMessageEvent = None):
         """
         修复4: uid="0"（机器人主动申请加群）场景单独处理，
         走 group_blacklist 校验而非 user blacklist
@@ -395,12 +411,12 @@ class RelationshipManager(Star):
 
         # uid="0" 表示机器人主动申请加群，跳过用户黑名单校验，只走群黑名单
         if uid and uid != "0" and self._blocked(uid, "group_invite"):
-            await self._api("set_group_add_request", flag=flag, approve=False, sub_type=sub)
+            await self._api("set_group_add_request", event=event, flag=flag, approve=False, sub_type=sub)
             await self._notify(f"🚫 自动拒绝黑名单群邀请\n邀请人: {uid}\n群号: {gid}")
             return
 
         if self._is_group_blocked(gid):
-            res = await self._api("set_group_add_request", flag=flag, approve=False, sub_type=sub)
+            res = await self._api("set_group_add_request", event=event, flag=flag, approve=False, sub_type=sub)
             if not res or res.get("retcode") != 0:
                 logger.warning(f"无法拒绝黑名单群 {gid} 的邀请（可能已被拉入），等待进群后处理")
             else:
@@ -413,7 +429,7 @@ class RelationshipManager(Star):
         inviter_nickname = uid if uid != "0" else "（机器人主动申请）"
         if uid and uid != "0":
             try:
-                info_res = await self._api("get_stranger_info", user_id=int(uid))
+                info_res = await self._api("get_stranger_info", event=event, user_id=int(uid))
                 if info_res and info_res.get("status") == "ok":
                     inviter_nickname = info_res.get("data", {}).get("nickname", uid)
             except Exception:
@@ -421,7 +437,7 @@ class RelationshipManager(Star):
 
         group_name = gid
         try:
-            group_res = await self._api("get_group_info", group_id=int(gid))
+            group_res = await self._api("get_group_info", event=event, group_id=int(gid))
             if group_res and group_res.get("status") == "ok":
                 group_name = group_res.get("data", {}).get("group_name", gid)
         except Exception:
@@ -486,11 +502,12 @@ class RelationshipManager(Star):
                             try:
                                 await self._api(
                                     "send_group_msg",
+                                    event=event,
                                     group_id=int(group_id),
                                     message="别老是让我进来又给我踢出去，烦不烦啊？！"
                                 )
                                 await asyncio.sleep(2)
-                                await self._api("set_group_leave", group_id=int(group_id))
+                                await self._api("set_group_leave", event=event, group_id=int(group_id))
                             except Exception as notify_err:
                                 logger.error(f"黑名单群 {group_id} 退群异常: {notify_err}")
                             logger.info(f"已自动退出黑名单群 {group_id}")
@@ -512,7 +529,7 @@ class RelationshipManager(Star):
             yield event.plain_result("❌ 仅管理员可用")
             return
 
-        res = await self._api("get_friend_list")
+        res = await self._api("get_friend_list", event=event)
         if not res or res.get("status") != "ok":
             yield event.plain_result("❌ 获取失败")
             return
@@ -538,7 +555,7 @@ class RelationshipManager(Star):
             yield event.plain_result("❌ 仅管理员可用")
             return
 
-        res = await self._api("get_group_list")
+        res = await self._api("get_group_list", event=event)
         if not res or res.get("status") != "ok":
             yield event.plain_result("❌ 获取失败")
             return
@@ -720,7 +737,7 @@ class RelationshipManager(Star):
             return
         comment = parts[1] if len(parts) > 1 else ""
 
-        res = await self._api("send_friend_add_request", user_id=int(uid), comment=comment)
+        res = await self._api("send_friend_add_request", event=event, user_id=int(uid), comment=comment)
 
         if res and res.get("status") == "ok":
             yield event.plain_result(f"✅ 已发送好友申请\n用户: {uid}\n备注: {comment or '无'}")
@@ -762,7 +779,7 @@ class RelationshipManager(Star):
             )
             return
 
-        res = await self._api("send_group_add_request", group_id=int(gid))
+        res = await self._api("send_group_add_request", event=event, group_id=int(gid))
 
         if res and res.get("status") == "ok":
             yield event.plain_result(f"✅ 已发送加群申请\n群号: {gid}")
@@ -797,7 +814,7 @@ class RelationshipManager(Star):
 
         ok, fail = [], []
         for u in uids:
-            r = await self._api("delete_friend", user_id=int(u))
+            r = await self._api("delete_friend", event=event, user_id=int(u))
             (ok if r and r.get("status") == "ok" else fail).append(u)
 
         parts = []
@@ -822,7 +839,7 @@ class RelationshipManager(Star):
 
         ok, fail = [], []
         for g in gids:
-            r = await self._api("set_group_leave", group_id=int(g))
+            r = await self._api("set_group_leave", event=event, group_id=int(g))
             (ok if r and r.get("status") == "ok" else fail).append(g)
 
         parts = []
@@ -869,10 +886,10 @@ class RelationshipManager(Star):
         if action == "block":
             try:
                 if info["type"] == "friend":
-                    await self._api("set_friend_add_request", flag=flag, approve=False)
+                    await self._api("set_friend_add_request", event=event, flag=flag, approve=False)
                 else:
                     await self._api(
-                        "set_group_add_request", flag=flag, approve=False,
+                        "set_group_add_request", event=event, flag=flag, approve=False,
                         sub_type=info.get("sub_type", "invite"),
                     )
             except Exception as e:
@@ -895,10 +912,10 @@ class RelationshipManager(Star):
         approve = (action == "accept")
         try:
             if info["type"] == "friend":
-                r = await self._api("set_friend_add_request", flag=flag, approve=approve)
+                r = await self._api("set_friend_add_request", event=event, flag=flag, approve=approve)
             else:
                 r = await self._api(
-                    "set_group_add_request", flag=flag, approve=approve,
+                    "set_group_add_request", event=event, flag=flag, approve=approve,
                     sub_type=info.get("sub_type", "invite"),
                 )
 
