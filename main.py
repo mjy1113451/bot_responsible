@@ -6,16 +6,17 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event.filter import EventMessageType
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
 
 @register(
     "astrbot_plugin_relationship_manager",
-    "YourName",
+    "mjy1113451",
     "AstrBot 关系管理插件",
     "5.2.0",
-    "https://github.com/your-repo/astrbot_plugin_relationship_manager",
+    "https://github.com/mjy1113451/bot_responsible",
 )
 class RelationshipManager(Star):
 
@@ -317,7 +318,7 @@ class RelationshipManager(Star):
 
     # ───────── 请求事件自动监听 ─────────
 
-    @filter.on_event()
+    @filter.event_message_type(EventMessageType.ALL)
     async def handle_event(self, event: AstrMessageEvent) -> Optional[AstrMessageEvent]:
         try:
             raw = event.message_obj.raw_message
@@ -466,7 +467,7 @@ class RelationshipManager(Star):
 
     # ───────── 通知事件监听（被踢 / 进群）─────────
 
-    @filter.on_notice()
+    @filter.event_message_type(EventMessageType.ALL)
     async def handle_notice(self, event: AstrMessageEvent):
         """
         修复9: asyncio.sleep(2) 包装在 try/except 中，防止 notice_type 不匹配时异常泄漏
