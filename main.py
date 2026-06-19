@@ -219,7 +219,7 @@ class RelationshipManager(Star):
         return None
 
     async def _notify(self, msg: str):
-"""修复7: 委托给 _notify_with_ids，忽略返回值"""
+        """修复7: 委托给 _notify_with_ids，忽略返回值"""
         await self._notify_with_ids(msg)
 
     async def _notify_with_ids(self, msg: str) -> List[str]:
@@ -324,7 +324,7 @@ class RelationshipManager(Star):
             if isinstance(raw, dict):
                 req_type = raw.get("request_type")
                 if req_type == "friend":
-await self._on_friend_req(raw)
+                    await self._on_friend_req(raw)
                     return None
                 elif req_type == "group" and raw.get("sub_type") == "invite":
                     await self._on_group_invite(raw)
@@ -435,7 +435,7 @@ await self._on_friend_req(raw)
         group_name = gid
         try:
             group_res = await self._api("get_group_info", group_id=int(gid))
-if group_res and group_res.get("status") == "ok":
+            if group_res and group_res.get("status") == "ok":
                 group_name = group_res.get("data", {}).get("group_name", gid)
         except Exception:
             pass
@@ -532,7 +532,7 @@ if group_res and group_res.get("status") == "ok":
 
         friends = res.get("data", [])
         if not friends:
-yield event.plain_result("📋 没有好友")
+            yield event.plain_result("📋 没有好友")
             return
 
         lines = ["📋 好友列表"]
@@ -652,7 +652,7 @@ yield event.plain_result("📋 没有好友")
             return
         if not self._is_admin(event):
             yield event.plain_result("❌ 仅管理员可用")
-return
+            return
 
         if not self.blacklist:
             yield event.plain_result("📋 黑名单为空")
@@ -760,7 +760,7 @@ return
 
         nums = self._ids(args)
         if not nums:
-yield event.plain_result("⚠️ /加群 群号")
+            yield event.plain_result("⚠️ /加群 群号")
             return
 
         gid = nums[0]
@@ -875,10 +875,14 @@ yield event.plain_result("⚠️ /加群 群号")
             nickname = info.get("nickname", uid)
             target = f"昵称：{nickname}\nQQ号：{uid}"
         else:
-                   if action == "block":
+            inviter_nickname = info.get('inviter_nickname', uid)
+            group_name = info.get('group_name', info.get('group_id', '?'))
+            target = f"群：{group_name}\n邀请人：{inviter_nickname}"
+
+        if action == "block":
             try:
                 if info["type"] == "friend":
-await self._api("set_friend_add_request", flag=flag, approve=False)
+                    await self._api("set_friend_add_request", flag=flag, approve=False)
                 else:
                     await self._api(
                         "set_group_add_request", flag=flag, approve=False,
@@ -989,7 +993,7 @@ await self._api("set_friend_add_request", flag=flag, approve=False)
             parts.append(f"⚠️ 已存在: {', '.join(dup)}")
         yield event.plain_result("\n".join(parts))
 
-@filter.command("解封群", alias=["rmblg"])
+    @filter.command("解封群", alias=["rmblg"])
     async def cmd_bl_rm_group(self, event: AstrMessageEvent, args: str = ""):
         if self._sender_blocked(event):
             return
@@ -1069,4 +1073,4 @@ await self._api("set_friend_add_request", flag=flag, approve=False)
     # ───────── 生命周期 ─────────
 
     async def terminate(self):
-        logger.info("关系管理插件已停止"）
+        logger.info("关系管理插件已停止")

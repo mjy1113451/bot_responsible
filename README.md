@@ -1,14 +1,178 @@
-# astrbot-plugin-helloworld
+# AstrBot 人际关系管理插件
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+> AstrBot 人际关系合集 - Bot 关系处理插件
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
-# Supports
+## 📖 简介
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+这是一个为 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 设计的**人际关系管理插件**，提供全面的黑名单管理、好友/群组管理、请求处理等功能。插件支持自动处理好友申请和群邀请，并提供智能的黑名单防护机制。
+
+## ✨ 功能特性
+
+### 🔒 黑名单管理
+- 拉黑/解封用户
+- 拉黑/解封群组
+- 自动拒绝黑名单用户的好友申请和群邀请
+- Bot 被踢出群后自动拉黑该群
+- Bot 被拉入黑名单群后自动退出
+
+### 👥 好友管理
+- 查看好友列表
+- 主动添加好友
+- 删除好友
+
+### 🏠 群组管理
+- 查看群列表
+- 主动加入群
+- 退出群组
+
+### 📩 请求处理
+- 自动接收并通知管理员好友申请
+- 自动接收并通知管理员群邀请
+- 支持引用消息快速同意/拒绝/拉黑
+- 待处理请求列表查看
+
+### 🔔 通知设置
+- 设置通知群接收所有提醒
+- 支持私聊通知（未设置通知群时）
+
+## 🛠️ 安装
+
+### 前置要求
+- [AstrBot](https://github.com/AstrBotDevs/AstrBot) 已安装并运行
+- Python 3.8+
+- OneBot v11/v12 协议支持
+
+### 安装步骤
+
+1. 进入 AstrBot 插件目录：
+```bash
+cd /path/to/AstrBot/data/plugins
+```
+
+2. 克隆本仓库：
+```bash
+git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relationship_manager
+```
+
+3. 重启 AstrBot 或在管理面板中重新加载插件
+
+## 📝 使用说明
+
+### 命令列表
+
+| 命令 | 别名 | 说明 | 权限 |
+|------|------|------|------|
+| `/好友` | `/fl` | 查看好友列表 | 管理员 |
+| `/群` | `/gl` | 查看群列表 | 管理员 |
+| `/拉黑` | `/addbl`, `/屏蔽` | 拉黑用户 | 管理员 |
+| `/解封` | `/rmbl`, `/取消屏蔽` | 解封用户 | 管理员 |
+| `/黑名单` | `/lsbl` | 查看黑名单 | 管理员 |
+| `/拉黑群` | `/addblg` | 拉黑群组 | 管理员 |
+| `/解封群` | `/rmblg` | 解封群组 | 管理员 |
+| `/待处理` | `/pending` | 查看待处理请求 | 管理员 |
+| `/加好友` | `/addfriend` | 添加好友 | 管理员 |
+| `/加群` | `/addgroup` | 加入群组 | 管理员 |
+| `/删好友` | `/deletefriend` | 删除好友 | 管理员 |
+| `/退群` | `/leavegroup` | 退出群组 | 管理员 |
+| `/同意` | `/accept` | 同意请求 | 管理员 |
+| `/拒绝` | `/reject` | 拒绝请求 | 管理员 |
+| `/拉黑` | `/blockreply` | 拒绝并拉黑 | 管理员 |
+| `/通知群` | `/setnotify`, `/setgroup` | 设置通知群 | 管理员 |
+
+### 使用示例
+
+#### 拉黑用户
+```
+/拉黑 123456789
+/拉黑 123456789 987654321  # 批量拉黑
+```
+
+#### 处理好友申请
+1. 收到好友申请通知后
+2. 引用该消息回复：
+   - `/同意` - 同意好友申请
+   - `/拒绝` - 拒绝好友申请
+   - `/拉黑` - 拒绝并拉黑该用户
+
+#### 设置通知群
+```
+/通知群 123456789  # 设置通知群
+/通知群 取消       # 取消通知群（改为私聊通知）
+```
+
+#### 查看待处理请求
+```
+/待处理
+```
+
+## ⚙️ 配置
+
+插件支持以下配置项（可在 AstrBot 配置面板中设置）：
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `data_path` | string | `data` | 数据存储路径 |
+| `notify_group` | string | `None` | 通知群号（为空则私聊通知） |
+
+## 🔧 工作原理
+
+### 自动处理机制
+
+1. **好友申请处理**
+   - 监听好友申请事件
+   - 检查发送者是否在黑名单中
+   - 自动拒绝黑名单用户
+   - 通知管理员进行人工处理
+
+2. **群邀请处理**
+   - 监听群邀请事件
+   - 检查邀请人和群组是否在黑名单中
+   - 自动拒绝黑名单邀请
+   - 通知管理员进行人工处理
+
+3. **被动防护**
+   - 监听 Bot 被踢出群事件
+   - 自动将该群加入黑名单
+   - 监听 Bot 被拉入群事件
+   - 如果是黑名单群，自动退出并通知
+
+### 数据持久化
+
+插件使用 JSON 文件存储数据：
+- `blacklist.json` - 黑名单数据
+- `pending.json` - 待处理请求数据
+
+## 🐛 已知问题
+
+- 暂无
+
+## 🤝 贡献
+
+欢迎提交 Issue 和 Pull Request！
+
+1. Fork 本仓库
+2. 创建你的特性分支 (`git checkout -b feature/AmazingFeature`)
+3. 提交你的更改 (`git commit -m 'Add some AmazingFeature'`)
+4. 推送到分支 (`git push origin feature/AmazingFeature`)
+5. 打开一个 Pull Request
+
+## 📄 许可证
+
+本项目基于 MIT 许可证开源 - 查看 [LICENSE](LICENSE) 文件了解详情
+
+## 🔗 相关链接
+
+- [AstrBot 官方仓库](https://github.com/AstrBotDevs/AstrBot)
+- [AstrBot 插件开发文档（中文）](https://docs.astrbot.app/dev/star/plugin-new.html)
+- [AstrBot 插件开发文档（英文）](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+
+## 📧 联系方式
+
+如有问题或建议，请通过 GitHub Issues 联系。
+
+---
+
+**感谢使用 AstrBot 人际关系管理插件！** 🎉
