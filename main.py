@@ -134,17 +134,9 @@ class RelationshipManager(Star):
     # ───────── 工具 ─────────
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
+        """使用 AstrBot 内置的管理员检测"""
         try:
-            sender_id = str(event.get_sender_id())
-            if hasattr(self.context, "get_admin_list"):
-                return sender_id in [str(a) for a in self.context.get_admin_list()]
-            if hasattr(self.context, "admin_list"):
-                return sender_id in [str(a) for a in self.context.admin_list]
-            config = self.context.get_config()
-            for key in ["admins", "admin_users", "admin_list"]:
-                if key in config:
-                    if sender_id in [str(a) for a in config[key]]:
-                        return True
+            return event.is_admin()
         except Exception as e:
             logger.error(f"管理员鉴权异常: {e}")
         return False
@@ -176,16 +168,10 @@ class RelationshipManager(Star):
         return bool(re.fullmatch(r"\d{5,12}", gid))
 
     def _get_admins(self) -> List[str]:
-        """修复8: 移除冗余 return []，重构异常处理"""
+        """获取管理员列表"""
         try:
-            if hasattr(self.context, "get_admin_list"):
-                return [str(a) for a in self.context.get_admin_list()]
-            if hasattr(self.context, "admin_list"):
-                return [str(a) for a in self.context.admin_list]
             config = self.context.get_config()
-            for key in ["admins", "admin_users", "admin_list"]:
-                if key in config:
-                    return [str(a) for a in config[key]]
+            return [str(a) for a in config.get("admins_id", [])]
         except Exception as e:
             logger.error(f"获取管理员列表异常: {e}")
         return []
