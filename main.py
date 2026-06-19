@@ -10,6 +10,24 @@ from astrbot.api.event.filter import EventMessageType
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
+# 尝试导入 AiocqhttpMessageEvent（用于类型提示）
+try:
+    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+        AiocqhttpMessageEvent,
+    )
+except ImportError:
+    AiocqhttpMessageEvent = None
+
+# 导入扩展功能（混淆模块）
+try:
+    from .pkg import ExpansionHandle
+except ImportError:
+    try:
+        from pkg import ExpansionHandle
+    except ImportError:
+        ExpansionHandle = None
+        logger.warning("expansion 模块未找到，加好友/加群功能将不可用")
+
 
 @register(
     "astrbot_plugin_relationship_manager",
@@ -198,7 +216,13 @@ class RelationshipManager(Star):
     async def _api(self, name: str, event: AstrMessageEvent = None, **kw) -> Optional[dict]:
         """调用 OneBot API"""
         try:
-            # 通过事件获取平台客户端
+            # 方式1: 通过 event.bot 直接获取客户端（推荐）
+            if event and hasattr(event, 'bot'):
+                client = event.bot
+                if client and hasattr(client, name):
+                    return await getattr(client, name)(**kw)
+
+            # 方式2: 通过平台获取客户端
             if event:
                 platform_id = event.get_platform_id()
                 platform = self.context.get_platform_inst(platform_id)
@@ -207,7 +231,7 @@ class RelationshipManager(Star):
                     if client and hasattr(client, name):
                         return await getattr(client, name)(**kw)
 
-            # 遍历所有平台查找支持的客户端
+            # 方式3: 遍历所有平台查找支持的客户端
             for platform in self.context.platform_manager.get_insts():
                 if hasattr(platform, 'get_client'):
                     client = platform.get_client()
@@ -226,18 +250,56 @@ class RelationshipManager(Star):
         """发送通知消息"""
         ids = []
         try:
-            from astrbot.api.message_components import Plain
-            message_chain = [Plain(text=msg)]
+            # 尝试获取客户端
+            client = None
+            try:
+                for platform in self.context.platform_manager.get_insts():
+                    if hasattr(platform, 'get_client'):
+                        client = platform.get_client()
+                        if client:
+                            break
+            except Exception:
+                pass
 
-            if self.notify_group:
-                # 发送到通知群
-                session = f"aiocqhttp:GroupMessage:{self.notify_group}"
-                await self.context.send_message(session, message_chain)
+            if client:
+                # 使用客户端直接发送
+                if self.notify_group:
+                    res = await client.send_group_msg(group_id=int(self.notify_group), message=msg)
+                    if res and isinstance(res, dict):
+                        mid = res.get("data", {}).get("message_id")
+                        if mid:
+                            ids.append(str(mid))
+                else:
+                    for aid in self._get_admins():
+                        res = await client.send_private_msg(user_id=int(aid), message=msg)
+                        if res and isinstance(res, dict):
+                            mid = res.get("data", {}).get("message_id")
+                            if mid:
+                                ids.append(str(mid))
             else:
-                # 发送给所有管理员
-                for aid in self._get_admins():
-                    session = f"aiocqhttp:FriendMessage:{aid}"
+                # 回退到 send_message
+                from astrbot.api.message_components import Plain
+                message_chain = [Plain(text=msg)]
+
+                # 获取平台名称
+                platform_name = "aiocqhttp"
+                try:
+                    for platform in self.context.platform_manager.get_insts():
+                        if hasattr(platform, 'meta'):
+                            meta = platform.meta()
+                            if hasattr(meta, 'name'):
+                                platform_name = meta.name
+                                break
+                except Exception:
+                    pass
+
+                if self.notify_group:
+                    session = f"{platform_name}:GroupMessage:{self.notify_group}"
                     await self.context.send_message(session, message_chain)
+                else:
+                    for aid in self._get_admins():
+                        session = f"{platform_name}:FriendMessage:{aid}"
+                        await self.context.send_message(session, message_chain)
         except Exception as e:
             logger.error(f"发送通知失败: {e}")
         return ids
@@ -728,31 +790,53 @@ class RelationshipManager(Star):
         parts = args.strip().split(maxsplit=1)
         uids = self._ids(args)
         if not uids:
-            yield event.plain_result("⚠️ /加好友 QQ号 [备注]")
+            yield event.plain_result("⚠️ /加好友 QQ号 [验证消息] [备注]")
             return
 
         uid = uids[0]
         if not self._valid_uid(uid):
             yield event.plain_result(f"⚠️ QQ号格式无效（需5-12位数字）: {uid}")
             return
-        comment = parts[1] if len(parts) > 1 else ""
 
-        res = await self._api("send_friend_add_request", event=event, user_id=int(uid), comment=comment)
+        # 解析参数
+        verify = ""
+        remark = ""
+        if len(parts) > 1:
+            sub_args = parts[1].split()
+            if len(sub_args) >= 1:
+                verify = sub_args[0]
+            if len(sub_args) >= 2:
+                remark = sub_args[1]
 
-        if res and res.get("status") == "ok":
-            yield event.plain_result(f"✅ 已发送好友申请\n用户: {uid}\n备注: {comment or '无'}")
+        # 获取客户端
+        client = None
+        if hasattr(event, 'bot'):
+            client = event.bot
         else:
-            flag = f"fr_{uid}_{int(datetime.now().timestamp())}"
-            async with self._lock:
-                self.pending[flag] = dict(
-                    type="friend", user_id=uid, comment=comment,
-                    time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    notify_ids=[],
-                )
-                self._save(self.pd_file, self.pending)
-            yield event.plain_result(
-                f"⚠️ 发送好友申请失败，已记录到待处理\n用户: {uid}"
+            for platform in self.context.platform_manager.get_insts():
+                if hasattr(platform, 'get_client'):
+                    client = platform.get_client()
+                    if client:
+                        break
+
+        if not client:
+            yield event.plain_result("❌ 无法获取客户端")
+            return
+
+        try:
+            self_id = int(event.get_self_id())
+            target_uin = int(uid)
+            msg = await ExpansionHandle.add_friend(
+                client=client,
+                target_uin=target_uin,
+                self_id=self_id,
+                verify=verify,
+                remark=remark,
             )
+            yield event.plain_result(msg)
+        except Exception as e:
+            logger.error(f"加好友失败: {e}")
+            yield event.plain_result(f"❌ 加好友失败: {str(e)}")
 
     @filter.command("加群", alias=["addgroup"])
     async def cmd_add_group(self, event: AstrMessageEvent, args: str = ""):
@@ -764,7 +848,7 @@ class RelationshipManager(Star):
 
         nums = self._ids(args)
         if not nums:
-            yield event.plain_result("⚠️ /加群 群号")
+            yield event.plain_result("⚠️ /加群 群号 [答案]")
             return
 
         gid = nums[0]
@@ -779,23 +863,38 @@ class RelationshipManager(Star):
             )
             return
 
-        res = await self._api("send_group_add_request", event=event, group_id=int(gid))
+        # 解析答案参数
+        answer = ""
+        parts = args.strip().split()
+        if len(parts) > 1:
+            answer = parts[1]
 
-        if res and res.get("status") == "ok":
-            yield event.plain_result(f"✅ 已发送加群申请\n群号: {gid}")
+        # 获取客户端
+        client = None
+        if hasattr(event, 'bot'):
+            client = event.bot
         else:
-            flag = f"gi_{gid}_{int(datetime.now().timestamp())}"
-            async with self._lock:
-                self.pending[flag] = dict(
-                    type="group", group_id=gid, user_id="0", sub_type="add",
-                    comment="主动加群",
-                    time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    notify_ids=[],
-                )
-            self._save(self.pd_file, self.pending)
-            yield event.plain_result(
-                f"⚠️ 加群失败，已记录到待处理\n群号: {gid}"
+            for platform in self.context.platform_manager.get_insts():
+                if hasattr(platform, 'get_client'):
+                    client = platform.get_client()
+                    if client:
+                        break
+
+        if not client:
+            yield event.plain_result("❌ 无法获取客户端")
+            return
+
+        try:
+            target_gid = int(gid)
+            msg = await ExpansionHandle.add_group(
+                client=client,
+                target_gid=target_gid,
+                answer=answer,
             )
+            yield event.plain_result(msg)
+        except Exception as e:
+            logger.error(f"加群失败: {e}")
+            yield event.plain_result(f"❌ 加群失败: {str(e)}")
 
     # ───────── 删好友 / 退群 ─────────
 
