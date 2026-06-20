@@ -181,7 +181,7 @@ class ExpansionHandle:
                 "6": {}, "7": {}, "8": {"2": 2}}},
             "12": 1}
         data = _PT.j2h(_json.dumps(p, ensure_ascii=False))
-        await client.api.call_action("send_packet", cmd=_d("T2lkYlN2Y3RycGNUVC4weDExZWNfMQ=="), data=data)
+        await client.api.call_action("send_packet", cmd=_d("T2lkYlN2Y1RycGNUY3AuMHgxMWVjXzE="), data=data)
         lines = ["【加群申请】已发送", f"群号：{target_gid}"]
         try:
             info = await client.get_group_info(group_id=target_gid, no_cache=True)
@@ -205,7 +205,7 @@ class ExpansionHandle:
                   "26": answer, "28": 1, "29": 1},
             "12": 1}
         data = _PT.j2h(_json.dumps(p, ensure_ascii=False))
-        await client.api.call_action("send_packet", cmd=_d("T2lkYlN2Y3RycGNUVC4weDdjMl81"), data=data)
+        await client.api.call_action("send_packet", cmd=_d("T2lkYlN2Y1RycGNUY3AuMHg3YzJfNQ=="), data=data)
         lines = ["【好友申请】已发送", f"Q号：{target_uin}"]
         try:
             info = await client.get_stranger_info(user_id=target_uin, no_cache=True)

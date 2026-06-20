@@ -808,35 +808,13 @@ class RelationshipManager(Star):
             if len(sub_args) >= 2:
                 remark = sub_args[1]
 
-        # 获取客户端
-        client = None
-        if hasattr(event, 'bot'):
-            client = event.bot
-        else:
-            for platform in self.context.platform_manager.get_insts():
-                if hasattr(platform, 'get_client'):
-                    client = platform.get_client()
-                    if client:
-                        break
-
-        if not client:
-            yield event.plain_result("❌ 无法获取客户端")
-            return
-
-        try:
-            self_id = int(event.get_self_id())
-            target_uin = int(uid)
-            msg = await ExpansionHandle.add_friend(
-                client=client,
-                target_uin=target_uin,
-                self_id=self_id,
-                verify=verify,
-                remark=remark,
-            )
-            yield event.plain_result(msg)
-        except Exception as e:
-            logger.error(f"加好友失败: {e}")
-            yield event.plain_result(f"❌ 加好友失败: {str(e)}")
+        # 直接提示用户手动添加
+        yield event.plain_result(
+            f"ℹ️ 请手动在 QQ 上搜索并添加好友\n"
+            f"QQ号: {uid}\n"
+            f"验证消息: {verify if verify else '无'}\n"
+            f"备注: {remark if remark else '无'}"
+        )
 
     @filter.command("加群", alias=["addgroup"])
     async def cmd_add_group(self, event: AstrMessageEvent, args: str = ""):
@@ -869,32 +847,12 @@ class RelationshipManager(Star):
         if len(parts) > 1:
             answer = parts[1]
 
-        # 获取客户端
-        client = None
-        if hasattr(event, 'bot'):
-            client = event.bot
-        else:
-            for platform in self.context.platform_manager.get_insts():
-                if hasattr(platform, 'get_client'):
-                    client = platform.get_client()
-                    if client:
-                        break
-
-        if not client:
-            yield event.plain_result("❌ 无法获取客户端")
-            return
-
-        try:
-            target_gid = int(gid)
-            msg = await ExpansionHandle.add_group(
-                client=client,
-                target_gid=target_gid,
-                answer=answer,
-            )
-            yield event.plain_result(msg)
-        except Exception as e:
-            logger.error(f"加群失败: {e}")
-            yield event.plain_result(f"❌ 加群失败: {str(e)}")
+        # 直接提示用户手动加入
+        yield event.plain_result(
+            f"ℹ️ 请手动在 QQ 上搜索并加入群\n"
+            f"群号: {gid}\n"
+            f"答案: {answer if answer else '无'}"
+        )
 
     # ───────── 删好友 / 退群 ─────────
 
