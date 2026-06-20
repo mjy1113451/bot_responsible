@@ -592,11 +592,19 @@ class RelationshipManager(Star):
             return
 
         res = await self._api("get_friend_list", event=event)
-        if not res or res.get("status") != "ok":
+        if not res:
             yield event.plain_result("❌ 获取失败")
             return
 
-        friends = res.get("data", [])
+        # API 返回格式：可能是 list 或 dict
+        if isinstance(res, list):
+            friends = res
+        elif isinstance(res, dict):
+            friends = res.get("data", [])
+        else:
+            yield event.plain_result("❌ 获取失败")
+            return
+
         if not friends:
             yield event.plain_result("📋 没有好友")
             return
@@ -618,11 +626,19 @@ class RelationshipManager(Star):
             return
 
         res = await self._api("get_group_list", event=event)
-        if not res or res.get("status") != "ok":
+        if not res:
             yield event.plain_result("❌ 获取失败")
             return
 
-        groups = res.get("data", [])
+        # API 返回格式：可能是 list 或 dict
+        if isinstance(res, list):
+            groups = res
+        elif isinstance(res, dict):
+            groups = res.get("data", [])
+        else:
+            yield event.plain_result("❌ 获取失败")
+            return
+
         if not groups:
             yield event.plain_result("📋 没有群")
             return
@@ -1061,7 +1077,7 @@ class RelationshipManager(Star):
         async for result in self._process_reply(event, action="reject"):
             yield result
 
-    @filter.command("拉黑", alias=["blockreply"])
+    @filter.command("拉黑请求", alias=["blockreply"])
     async def cmd_block_reply(self, event: AstrMessageEvent):
         async for result in self._process_reply(event, action="block"):
             yield result
