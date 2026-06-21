@@ -612,9 +612,14 @@ class RelationshipManager(Star):
         lines = ["📋 好友列表"]
         for i, f in enumerate(friends, 1):
             uid = f.get("user_id", "?")
+            nickname = f.get("nickname", "?")
+            remark = f.get("remark", "")
+            # 显示备注名（如果有）
+            display_name = f"{remark}({nickname})" if remark and remark != nickname else nickname
             tag = " 🚫" if self._blocked(str(uid)) else ""
-            lines.append(f"{i}. {f.get('nickname', '?')} ({uid}){tag}")
+            lines.append(f"{i}. {display_name} ({uid}){tag}")
 
+        lines.append(f"\n💡 共 {len(friends)} 人")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("群", alias=["gl"])
@@ -646,9 +651,12 @@ class RelationshipManager(Star):
         lines = ["📋 群列表"]
         for i, g in enumerate(groups, 1):
             gid = g.get('group_id', '?')
+            group_name = g.get('group_name', '?')
+            member_count = g.get('member_count', '?')
             tag = " 🚫" if self._is_group_blocked(str(gid)) else ""
-            lines.append(f"{i}. {g.get('group_name', '?')} ({gid}){tag}")
+            lines.append(f"{i}. {group_name} ({gid}) {member_count}人{tag}")
 
+        lines.append(f"\n💡 共 {len(groups)} 个群")
         yield event.plain_result("\n".join(lines))
 
     # ───────── 黑名单 ─────────
