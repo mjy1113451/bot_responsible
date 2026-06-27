@@ -67,7 +67,7 @@ git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relat
 |------|------|------|------|
 | `/好友` | `/fl` | 查看好友列表 | 管理员 |
 | `/群` | `/gl` | 查看群列表 | 管理员 |
-| `/拉黑` | `/addbl`, `/屏蔽` | 拉黑用户 | 管理员 |
+| `/拉黑` | `/addbl`, `/屏蔽` | 拉黑用户；引用通知时拒绝并拉黑请求 | 管理员 |
 | `/解封` | `/rmbl`, `/取消屏蔽` | 解封用户 | 管理员 |
 | `/黑名单` | `/lsbl` | 查看黑名单 | 管理员 |
 | `/拉黑群` | `/addblg` | 拉黑群组 | 管理员 |
@@ -77,9 +77,9 @@ git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relat
 | `/加群` | `/addgroup` | 加入群组 | 管理员 |
 | `/删好友` | `/deletefriend` | 删除好友 | 管理员 |
 | `/退群` | `/leavegroup` | 退出群组 | 管理员 |
-| `/同意` | `/accept` | 同意请求 | 管理员 |
-| `/拒绝` | `/reject` | 拒绝请求 | 管理员 |
-| `/拉黑` | `/blockreply` | 拒绝并拉黑 | 管理员 |
+| `/同意` | `/accept` | 同意请求；支持引用通知或 `/同意 编号` | 管理员 |
+| `/拒绝` | `/reject` | 拒绝请求；支持引用通知或 `/拒绝 编号` | 管理员 |
+| `/拉黑请求` | `/blockreply` | 拒绝并拉黑请求；支持引用通知或 `/拉黑请求 编号` | 管理员 |
 | `/通知群` | `/setnotify`, `/setgroup` | 设置通知群 | 管理员 |
 
 ### 使用示例
@@ -92,10 +92,11 @@ git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relat
 
 #### 处理好友申请
 1. 收到好友申请通知后
-2. 引用该消息回复：
+2. 引用该消息回复，或使用通知里的编号：
    - `/同意` - 同意好友申请
    - `/拒绝` - 拒绝好友申请
    - `/拉黑` - 拒绝并拉黑该用户
+   - `/同意 ab12cd34ef` - 按编号同意
 
 #### 设置通知群
 ```
@@ -147,7 +148,7 @@ git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relat
 
 ## 🐛 已知问题
 
-- 暂无
+- `/加好友`、`/加群` 依赖 NapCat 的 Packet 能力；若底层未启用或版本不支持，命令会提示手动处理。
 
 ## 🤝 贡献
 

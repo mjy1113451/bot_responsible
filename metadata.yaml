@@ -1,6 +1,6 @@
 name: astrbot_plugin_relationship_manager
 display_name: 人际关系合集
 desc: bot关系处理
-version: v0.01
+version: v5.2.0
 author: mjy1113451
 repo: https://github.com/mjy1113451/bot_responsible

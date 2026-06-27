@@ -1,6 +1,7 @@
 import json
 import re
 import asyncio
+import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
@@ -68,6 +69,12 @@ class RelationshipManager(Star):
         self.notify_group: Optional[str] = config.get("notify_group", None)
         self._lock = asyncio.Lock()
         self._cleanup_pending()
+        logger.info(
+            "关系管理插件初始化完成: data_dir=%s, pending_file=%s, pending_count=%s",
+            self.data_dir,
+            self.pd_file,
+            len(self.pending),
+        )
 
     # ───────── 持久化 ─────────
 
@@ -126,17 +133,18 @@ class RelationshipManager(Star):
                 new_blacklist[uid] = val
 
         # 检查顶层是否有游离的 group_blacklist entry（修复2）
-        # 如果某个 key 的值是群号字符串，迁入 group_blacklist
+        # 旧版只有在 value 明确带群特征时才迁移，避免把普通用户黑名单误判成群黑名单
         to_migrate_groups: Dict[str, dict] = {}
         for uid, val in list(entries):
             if uid == "group_blacklist":
                 continue
-            # 旧版可能把群号直接放在顶层，格式是 {"123456": "group"} 或 {"123456": {"time": "..."}}
-            if isinstance(val, str) and self._valid_gid(uid):
-                to_migrate_groups[uid] = {"time": now, "source": "migrated"}
-                changed = True
-            elif isinstance(val, dict) and "group_name" in val and self._valid_gid(uid):
-# 看起来是群条目，不是用户
+            if not self._valid_gid(uid):
+                continue
+
+            # 仅迁移带明显群信息的旧条目；字符串值没有足够信息，保守保留为用户黑名单
+            if isinstance(val, dict) and (
+                "group_name" in val or "group_id" in val or str(val.get("type", "")).lower() == "group"
+            ):
                 to_migrate_groups[uid] = {"time": val.get("time", now), "source": "migrated"}
                 changed = True
 
@@ -249,6 +257,47 @@ class RelationshipManager(Star):
         """修复7: 委托给 _notify_with_ids，忽略返回值"""
         await self._notify_with_ids(msg)
 
+    def _collect_message_ids(self, payload: Any) -> List[str]:
+        ids: List[str] = []
+        seen: Set[int] = set()
+
+        def walk(node: Any):
+            if node is None:
+                return
+
+            if isinstance(node, (str, int, float, bool, bytes)):
+                return
+
+            node_id = id(node)
+            if node_id in seen:
+                return
+            seen.add(node_id)
+
+            if isinstance(node, dict):
+                for key in ("message_id", "real_id", "message_seq", "messageId", "realId", "messageSeq"):
+                    normalized = self._normalize_msg_id(node.get(key))
+                    if normalized and normalized not in ids:
+                        ids.append(normalized)
+                for value in node.values():
+                    walk(value)
+                return
+
+            if isinstance(node, (list, tuple, set)):
+                for item in node:
+                    walk(item)
+                return
+
+            for key in ("message_id", "real_id", "message_seq", "messageId", "realId", "messageSeq"):
+                normalized = self._normalize_msg_id(getattr(node, key, None))
+                if normalized and normalized not in ids:
+                    ids.append(normalized)
+
+            for key in ("data", "message", "messages", "raw_message"):
+                walk(getattr(node, key, None))
+
+        walk(payload)
+        return ids
+
     async def _notify_with_ids(self, msg: str) -> List[str]:
         """发送通知消息"""
         ids = []
@@ -269,16 +318,12 @@ class RelationshipManager(Star):
                 if self.notify_group:
                     res = await client.send_group_msg(group_id=int(self.notify_group), message=msg)
                     if res and isinstance(res, dict):
-                        mid = res.get("data", {}).get("message_id")
-                        if mid:
-                            ids.append(str(mid))
+                        ids.extend(self._collect_message_ids(res))
                 else:
                     for aid in self._get_admins():
                         res = await client.send_private_msg(user_id=int(aid), message=msg)
                         if res and isinstance(res, dict):
-                            mid = res.get("data", {}).get("message_id")
-                            if mid:
-                                ids.append(str(mid))
+                            ids.extend(self._collect_message_ids(res))
             else:
                 # 回退到 send_message
                 from astrbot.api.message_components import Plain
@@ -305,7 +350,7 @@ class RelationshipManager(Star):
                         await self.context.send_message(session, message_chain)
         except Exception as e:
             logger.error(f"发送通知失败: {e}")
-        return ids
+        return list(dict.fromkeys(ids))
 
     @staticmethod
     def _normalize_msg_id(value: Any) -> Optional[str]:
@@ -315,6 +360,137 @@ class RelationshipManager(Star):
             return None
         text = str(value).strip()
         return text or None
+
+    @staticmethod
+    def _new_request_id() -> str:
+        return uuid.uuid4().hex[:10]
+
+    def _find_dict_in_node(self, node: Any, predicate) -> Optional[dict]:
+        seen: Set[int] = set()
+
+        def walk(current: Any) -> Optional[dict]:
+            if current is None:
+                return None
+
+            if isinstance(current, str):
+                text = current.strip()
+                if text[:1] in ("{", "["):
+                    try:
+                        current = json.loads(text)
+                    except Exception:
+                        return None
+                else:
+                    return None
+
+            if isinstance(current, (int, float, bool, bytes)):
+                return None
+
+            current_id = id(current)
+            if current_id in seen:
+                return None
+            seen.add(current_id)
+
+            if isinstance(current, dict):
+                try:
+                    if predicate(current):
+                        return current
+                except Exception:
+                    pass
+
+                for key in (
+                    "message_obj",
+                    "raw_message",
+                    "message",
+                    "messages",
+                    "content",
+                    "elements",
+                    "segments",
+                    "data",
+                    "payload",
+                    "extra",
+                    "quote",
+                    "source",
+                    "reply",
+                    "message_reference",
+                ):
+                    result = walk(current.get(key))
+                    if result is not None:
+                        return result
+
+                for value in current.values():
+                    result = walk(value)
+                    if result is not None:
+                        return result
+                return None
+
+            if isinstance(current, (list, tuple, set)):
+                for item in current:
+                    result = walk(item)
+                    if result is not None:
+                        return result
+                return None
+
+            for attr in (
+                "message_obj",
+                "raw_message",
+                "message",
+                "messages",
+                "content",
+                "elements",
+                "segments",
+                "data",
+                "payload",
+                "extra",
+                "quote",
+                "source",
+                "reply",
+                "message_reference",
+            ):
+                try:
+                    result = walk(getattr(current, attr, None))
+                    if result is not None:
+                        return result
+                except Exception:
+                    continue
+
+            return None
+
+        return walk(node)
+
+    @staticmethod
+    def _looks_like_friend_request(payload: dict) -> bool:
+        request_type = str(payload.get("request_type", "")).lower()
+        post_type = str(payload.get("post_type", "")).lower()
+        has_flag = bool(payload.get("flag"))
+        has_user = bool(payload.get("user_id"))
+        has_group = bool(payload.get("group_id"))
+        return (
+            request_type == "friend"
+            or (post_type == "request" and has_flag and has_user and not has_group)
+            or (has_flag and has_user and not has_group)
+        )
+
+    @staticmethod
+    def _looks_like_group_request(payload: dict) -> bool:
+        request_type = str(payload.get("request_type", "")).lower()
+        post_type = str(payload.get("post_type", "")).lower()
+        has_flag = bool(payload.get("flag"))
+        has_user = bool(payload.get("user_id"))
+        has_group = bool(payload.get("group_id"))
+        return (
+            request_type == "group"
+            or (post_type == "request" and has_flag and has_group)
+            or (has_flag and has_group and has_user)
+        )
+
+    @staticmethod
+    def _looks_like_notice(payload: dict) -> bool:
+        notice_type = str(payload.get("notice_type", "")).lower()
+        post_type = str(payload.get("post_type", "")).lower()
+        return bool(notice_type) or post_type == "notice"
+
+    def _extract_event_payload(self, event: AstrMessageEvent, predicate) -> Optional[dict]:
+        return self._find_dict_in_node(event, predicate)
 
     def _extract_reply_id_from_text(self, text: str) -> Optional[str]:
         if not text:
@@ -453,6 +629,185 @@ class RelationshipManager(Star):
                 return flag
         return None
 
+    def _find_flag_by_request_id(self, request_id: str) -> Optional[str]:
+        target_request_id = self._normalize_msg_id(request_id)
+        if not target_request_id:
+            return None
+        for flag, info in self.pending.items():
+            if self._normalize_msg_id(info.get("request_id")) == target_request_id:
+                return flag
+        return None
+
+    def _find_flag_from_args(self, args: str) -> Optional[str]:
+        text = str(args or "").strip()
+        if not text:
+            return None
+
+        candidates = self._extract_pending_candidates_from_text(text)
+        for candidate in candidates:
+            flag = self._find_flag_by_request_id(candidate)
+            if flag:
+                return flag
+            if candidate in self.pending:
+                return candidate
+        return None
+
+    def _extract_pending_candidates_from_text(self, text: str) -> List[str]:
+        if not text:
+            return []
+
+        candidates: List[str] = []
+
+        for uid in self._ids(text):
+            if uid not in candidates:
+                candidates.append(uid)
+
+        for pattern in (
+            r"编号[:：]\s*([^\n\r]+)",
+            r"QQ号[:：]\s*([^\n\r]+)",
+            r"邀请人QQ[:：]\s*([^\n\r]+)",
+            r"群号[:：]\s*([^\n\r]+)",
+            r"昵称[:：]\s*([^\n\r]+)",
+            r"邀请人昵称[:：]\s*([^\n\r]+)",
+            r"群名称[:：]\s*([^\n\r]+)",
+        ):
+            for match in re.findall(pattern, text):
+                value = str(match).strip()
+                if value and value not in candidates:
+                    candidates.append(value)
+
+        return candidates
+
+    def _find_flag_by_quote_text(self, event: AstrMessageEvent) -> Optional[str]:
+        texts: List[str] = []
+
+        for candidate in (
+            event,
+            getattr(event, "message_obj", None),
+            getattr(getattr(event, "message_obj", None), "message", None),
+            getattr(getattr(event, "message_obj", None), "raw_message", None),
+        ):
+            for text in self._collect_text_fragments(candidate):
+                if text and text not in texts:
+                    texts.append(text)
+
+        try:
+            message_str = str(event.get_message_str() or "")
+            if message_str and message_str not in texts:
+                texts.append(message_str)
+        except Exception:
+            pass
+
+        for text in texts:
+            if "好友申请" not in text and "群邀请" not in text:
+                continue
+
+            candidates = self._extract_pending_candidates_from_text(text)
+            if not candidates:
+                continue
+
+            for flag, info in reversed(list(self.pending.items())):
+                request_id = str(info.get("request_id", "")).strip()
+                values = {
+                    str(info.get("user_id", "")).strip(),
+                    str(info.get("group_id", "")).strip(),
+                    str(info.get("nickname", "")).strip(),
+                    str(info.get("inviter_nickname", "")).strip(),
+                    str(info.get("group_name", "")).strip(),
+                    request_id,
+                    str(flag).strip(),
+                }
+                if any(candidate in values for candidate in candidates):
+                    return flag
+
+        return None
+
+    def _collect_text_fragments(self, node: Any) -> List[str]:
+        texts: List[str] = []
+        seen: Set[int] = set()
+
+        def add_text(value: Any):
+            if value is None:
+                return
+            if isinstance(value, bytes):
+                try:
+                    value = value.decode("utf-8", errors="ignore")
+                except Exception:
+                    return
+            if not isinstance(value, str):
+                value = str(value)
+            text = value.strip()
+            if text and text not in texts:
+                texts.append(text)
+
+        def walk(current: Any):
+            if current is None:
+                return
+
+            if isinstance(current, str):
+                add_text(current)
+                stripped = current.strip()
+                if stripped[:1] in ("{", "["):
+                    try:
+                        current = json.loads(stripped)
+                    except Exception:
+                        return
+                else:
+                    return
+
+            if isinstance(current, (int, float, bool, bytes)):
+                if isinstance(current, bytes):
+                    add_text(current)
+                return
+
+            current_id = id(current)
+            if current_id in seen:
+                return
+            seen.add(current_id)
+
+            if isinstance(current, dict):
+                for key in ("text", "content", "summary", "raw_message", "message"):
+                    value = current.get(key)
+                    if isinstance(value, (str, bytes)):
+                        add_text(value)
+                if str(current.get("type", "")).lower() == "text":
+                    data = current.get("data")
+                    if isinstance(data, dict):
+                        add_text(data.get("text"))
+                    elif isinstance(data, (str, bytes)):
+                        add_text(data)
+                for value in current.values():
+                    walk(value)
+                return
+
+            if isinstance(current, (list, tuple, set)):
+                for item in current:
+                    walk(item)
+                return
+
+            for attr in (
+                "text",
+                "content",
+                "summary",
+                "raw_message",
+                "message",
+                "messages",
+                "data",
+                "elements",
+                "segments",
+                "quote",
+                "source",
+                "reply",
+                "message_reference",
+            ):
+                try:
+                    walk(getattr(current, attr, None))
+                except Exception:
+                    continue
+
+        walk(node)
+        return texts
+
     def _cleanup_pending(self):
         now = datetime.now()
         expired = []
@@ -462,7 +817,7 @@ class RelationshipManager(Star):
                 if now - t > timedelta(days=self.PENDING_TTL_DAYS):
                     expired.append(flag)
             except (ValueError, TypeError):
-                expired.append(flag)
+                logger.warning(f"待处理时间格式异常，保留不删: flag={flag}, time={info.get('time')!r}")
         if expired:
             for flag in expired:
                 self.pending.pop(flag, None)
@@ -495,15 +850,17 @@ class RelationshipManager(Star):
     @filter.event_message_type(EventMessageType.ALL)
     async def handle_event(self, event: AstrMessageEvent) -> Optional[AstrMessageEvent]:
         try:
-            raw = event.message_obj.raw_message
-            if isinstance(raw, dict):
-                req_type = raw.get("request_type")
-                if req_type == "friend":
-                    await self._on_friend_req(raw, event)
-                    return None
-                elif req_type == "group" and raw.get("sub_type") == "invite":
-                    await self._on_group_invite(raw, event)
-                    return None
+            raw = self._extract_event_payload(event, self._looks_like_friend_request)
+            if raw:
+                logger.info("捕获好友申请事件: keys=%s", sorted(raw.keys()))
+                await self._on_friend_req(raw, event)
+                return None
+
+            raw = self._extract_event_payload(event, self._looks_like_group_request)
+            if raw and str(raw.get("sub_type", "invite")).lower() == "invite":
+                logger.info("捕获群邀请事件: keys=%s", sorted(raw.keys()))
+                await self._on_group_invite(raw, event)
+                return None
         except Exception as e:
             logger.error(f"处理请求事件异常: {e}")
 
@@ -520,6 +877,7 @@ class RelationshipManager(Star):
         uid = str(raw.get("user_id", ""))
         flag = str(raw.get("flag", ""))
         comment = raw.get("comment", "") or ""
+        request_id = self._new_request_id()
 
         if not uid or not flag:
             return
@@ -546,11 +904,16 @@ class RelationshipManager(Star):
                 type="friend", user_id=uid, nickname=nickname, comment=comment,
                 time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 notify_ids=[],
+                request_id=request_id,
+                request_flag=flag,
+                request_type="friend",
             )
             self._save(self.pd_file, self.pending)
+        logger.info(f"已记录好友申请待处理: flag={flag}, request_id={request_id}, uid={uid}, nickname={nickname}")
 
         msg_ids = await self._notify_with_ids(
             f"【好友申请】同意/拒绝/拉黑：\n"
+            f"编号：{request_id}\n"
             f"昵称：{nickname}\n"
             f"QQ号：{uid}\n"
             f"验证信息：{comment if comment else '无'}\n"
@@ -560,6 +923,9 @@ class RelationshipManager(Star):
             async with self._lock:
                 self.pending[flag]["notify_ids"] = msg_ids
                 self._save(self.pd_file, self.pending)
+            logger.info(f"好友申请通知消息ID已记录: flag={flag}, ids={msg_ids}")
+        else:
+            logger.warning(f"好友申请通知未获取到可匹配的消息ID: flag={flag}, uid={uid}")
 
     async def _on_group_invite(self, raw: dict, event: AstrMessageEvent = None):
         """
@@ -571,6 +937,7 @@ class RelationshipManager(Star):
         flag = str(raw.get("flag", ""))
         comment = raw.get("comment", "") or ""
         sub = raw.get("sub_type", "invite")
+        request_id = self._new_request_id()
         if not flag:
             return
 
@@ -622,11 +989,16 @@ class RelationshipManager(Star):
                 sub_type=sub, comment=comment,
                 time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 notify_ids=[],
+                request_id=request_id,
+                request_flag=flag,
+                request_type="group",
             )
             self._save(self.pd_file, self.pending)
+        logger.info(f"已记录群邀请待处理: flag={flag}, request_id={request_id}, gid={gid}, uid={uid}")
 
         msg_ids = await self._notify_with_ids(
             f"【群邀请】同意/拒绝/拉黑：\n"
+            f"编号：{request_id}\n"
             f"邀请人昵称：{inviter_nickname}\n"
             f"邀请人QQ：{uid}\n"
             f"群名称：{group_name}\n"
@@ -638,6 +1010,9 @@ class RelationshipManager(Star):
             async with self._lock:
                 self.pending[flag]["notify_ids"] = msg_ids
                 self._save(self.pd_file, self.pending)
+            logger.info(f"群邀请通知消息ID已记录: flag={flag}, ids={msg_ids}")
+        else:
+            logger.warning(f"群邀请通知未获取到可匹配的消息ID: flag={flag}, gid={gid}")
 
     # ───────── 通知事件监听（被踢 / 进群）─────────
 
@@ -647,8 +1022,9 @@ class RelationshipManager(Star):
         修复9: asyncio.sleep(2) 包装在 try/except 中，防止 notice_type 不匹配时异常泄漏
         """
         try:
-            raw = event.message_obj.raw_message
+            raw = self._extract_event_payload(event, self._looks_like_notice)
             if isinstance(raw, dict):
+                logger.info("捕获通知事件: keys=%s", sorted(raw.keys()))
                 notice_type = raw.get("notice_type")
                 group_id = str(raw.get("group_id", ""))
                 user_id = str(raw.get("user_id", ""))
@@ -883,6 +1259,7 @@ class RelationshipManager(Star):
         async with self._lock:
             self._cleanup_pending()
             pending_snapshot = dict(self.pending)
+        logger.info(f"待处理查询: pending_count={len(pending_snapshot)}, file={self.pd_file}")
 
         if not pending_snapshot:
             yield event.plain_result("📋 无待处理请求")
@@ -891,18 +1268,19 @@ class RelationshipManager(Star):
         lines = ["📋 待处理请求（引用对应消息回复 /同意 或 /拒绝 或 /拉黑）"]
         for flag, info in pending_snapshot.items():
             t = info.get("time", "?")
+            request_id = info.get("request_id", flag)
             if info["type"] == "friend":
                 nickname = info.get('nickname', info['user_id'])
                 comment = info.get('comment') or '无'
                 lines.append(
-                    f"🔹 好友 | 昵称:{nickname} QQ:{info['user_id']} | 验证:{comment} | {t}"
+                    f"🔹 好友 | 编号:{request_id} | 昵称:{nickname} QQ:{info['user_id']} | 验证:{comment} | {t}"
                 )
             else:
                 inviter_nickname = info.get('inviter_nickname', info['user_id'])
                 group_name = info.get('group_name', info['group_id'])
                 comment = info.get('comment') or '无'
                 lines.append(
-                    f"🔸 群邀 | 群:{group_name}({info['group_id']}) | 邀请人:{inviter_nickname}({info['user_id']}) | 验证:{comment} | {t}"
+                    f"🔸 群邀 | 编号:{request_id} | 群:{group_name}({info['group_id']}) | 邀请人:{inviter_nickname}({info['user_id']}) | 验证:{comment} | {t}"
                 )
 
         yield event.plain_result("\n".join(lines))
@@ -1100,20 +1478,25 @@ class RelationshipManager(Star):
 
     # ───────── 同意 / 拒绝 / 拉黑（统一审批）─────────
 
-    async def _process_reply(self, event: AstrMessageEvent, action: str):
+    async def _process_reply(self, event: AstrMessageEvent, action: str, args: str = ""):
         if self._sender_blocked(event):
             return
         if not self._is_admin(event):
             yield event.plain_result("❌ 仅管理员可用")
             return
 
-        reply_id = self._get_reply_id(event)
-        if not reply_id:
-            yield event.plain_result("⚠️ 请引用通知消息回复 /同意 或 /拒绝 或 /拉黑")
-            return
-
-        flag = self._find_flag_by_msg_id(reply_id)
+        flag = self._find_flag_from_args(args)
+        reply_id = self._get_reply_id(event) if not flag else None
+        flag = flag or (self._find_flag_by_msg_id(reply_id) if reply_id else None)
         if not flag:
+            flag = self._find_flag_by_quote_text(event)
+        if not flag:
+            if args:
+                yield event.plain_result("❌ 未匹配到对应待处理编号")
+                return
+            if not reply_id:
+                yield event.plain_result("⚠️ 请引用通知消息回复 /同意 或 /拒绝 或 /拉黑，或使用 /同意 编号")
+                return
             yield event.plain_result("❌ 该引用消息未匹配到待处理请求")
             return
 
@@ -1182,18 +1565,18 @@ class RelationshipManager(Star):
             yield event.plain_result("❌ 操作异常，请查看日志")
 
     @filter.command("同意", alias=["accept"])
-    async def cmd_accept(self, event: AstrMessageEvent):
-        async for result in self._process_reply(event, action="accept"):
+    async def cmd_accept(self, event: AstrMessageEvent, args: str = ""):
+        async for result in self._process_reply(event, action="accept", args=args):
             yield result
 
     @filter.command("拒绝", alias=["reject"])
-    async def cmd_reject(self, event: AstrMessageEvent):
-        async for result in self._process_reply(event, action="reject"):
+    async def cmd_reject(self, event: AstrMessageEvent, args: str = ""):
+        async for result in self._process_reply(event, action="reject", args=args):
             yield result
 
     @filter.command("拉黑请求", alias=["blockreply"])
-    async def cmd_block_reply(self, event: AstrMessageEvent):
-        async for result in self._process_reply(event, action="block"):
+    async def cmd_block_reply(self, event: AstrMessageEvent, args: str = ""):
+        async for result in self._process_reply(event, action="block", args=args):
             yield result
 
     # ───────── 群黑名单管理命令 ─────────
