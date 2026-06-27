@@ -3,7 +3,7 @@ import re
 import asyncio
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.event.filter import EventMessageType
@@ -42,6 +42,9 @@ class RelationshipManager(Star):
     _CQ_REPLY_RE = re.compile(r"\[CQ:reply,id=(\d+)\]")
     # OneBot v12 / 标准 reply 结构匹配
     _MSG_ID_RE = re.compile(r'"message_id"\s*:\s*"?(\d+)"?')
+    _REPLY_ID_KEYS = ("id", "message_id", "messageId", "msg_id", "msgId")
+    _REPLY_CONTAINER_KEYS = ("reply", "source", "quote", "message_reference")
+    _REPLY_TYPE_NAMES = ("reply", "source", "quote")
 
     # 待处理请求过期时间（天）
     PENDING_TTL_DAYS = 7
@@ -304,42 +307,149 @@ class RelationshipManager(Star):
             logger.error(f"发送通知失败: {e}")
         return ids
 
+    @staticmethod
+    def _normalize_msg_id(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _extract_reply_id_from_text(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+
+        match = self._CQ_REPLY_RE.search(text)
+        if match:
+            return self._normalize_msg_id(match.group(1))
+
+        lower_text = text.lower()
+        if any(name in lower_text for name in self._REPLY_TYPE_NAMES):
+            match = self._MSG_ID_RE.search(text)
+            if match:
+                return self._normalize_msg_id(match.group(1))
+
+        return None
+
+    def _extract_reply_id_from_node(
+        self, node: Any, seen: Set[int], allow_direct_id: bool = False
+    ) -> Optional[str]:
+        if node is None:
+            return None
+
+        if isinstance(node, str):
+            return self._extract_reply_id_from_text(node)
+
+        if isinstance(node, (int, float, bool, bytes)):
+            return None
+
+        node_identity = id(node)
+        if node_identity in seen:
+            return None
+        seen.add(node_identity)
+
+        if isinstance(node, dict):
+            if allow_direct_id:
+                for key in self._REPLY_ID_KEYS:
+                    reply_id = self._normalize_msg_id(node.get(key))
+                    if reply_id:
+                        return reply_id
+
+            node_type = str(node.get("type", "")).lower()
+            if node_type in self._REPLY_TYPE_NAMES:
+                data = node.get("data")
+                if isinstance(data, dict):
+                    for key in self._REPLY_ID_KEYS:
+                        reply_id = self._normalize_msg_id(data.get(key))
+                        if reply_id:
+                            return reply_id
+                for key in self._REPLY_ID_KEYS:
+                    reply_id = self._normalize_msg_id(node.get(key))
+                    if reply_id:
+                        return reply_id
+
+            for key in self._REPLY_CONTAINER_KEYS:
+                if key in node:
+                    reply_id = self._extract_reply_id_from_node(
+                        node.get(key), seen, allow_direct_id=True
+                    )
+                    if reply_id:
+                        return reply_id
+
+            for key in ("message", "messages", "content", "elements", "segments", "data"):
+                if key in node:
+                    reply_id = self._extract_reply_id_from_node(node.get(key), seen)
+                    if reply_id:
+                        return reply_id
+
+            return self._extract_reply_id_from_text(str(node))
+
+        if isinstance(node, (list, tuple, set)):
+            for item in node:
+                reply_id = self._extract_reply_id_from_node(item, seen)
+                if reply_id:
+                    return reply_id
+            return None
+
+        component_type = str(getattr(node, "type", "") or getattr(node, "component_type", "")).lower()
+        class_name = node.__class__.__name__.lower()
+        if component_type in self._REPLY_TYPE_NAMES or any(name in class_name for name in self._REPLY_TYPE_NAMES):
+            for key in self._REPLY_ID_KEYS:
+                reply_id = self._normalize_msg_id(getattr(node, key, None))
+                if reply_id:
+                    return reply_id
+            reply_id = self._extract_reply_id_from_node(
+                getattr(node, "data", None), seen, allow_direct_id=True
+            )
+            if reply_id:
+                return reply_id
+
+        for key in self._REPLY_CONTAINER_KEYS:
+            reply_id = self._extract_reply_id_from_node(
+                getattr(node, key, None), seen, allow_direct_id=True
+            )
+            if reply_id:
+                return reply_id
+
+        for key in ("message", "messages", "content", "elements", "segments", "raw_message", "data"):
+            reply_id = self._extract_reply_id_from_node(getattr(node, key, None), seen)
+            if reply_id:
+                return reply_id
+
+        return self._extract_reply_id_from_text(str(node))
+
     def _get_reply_id(self, event: AstrMessageEvent) -> Optional[str]:
         """
-        修复5: 兼容 dict 形式的 CQ 码（OneBot 某些实现 message 元素是 dict 而非对象）
+        兼容 AstrBot 组件对象、OneBot array 上报、CQ 码字符串和原始事件 dict 中的引用消息结构。
         """
-        try:
-            for comp in event.message_obj.message:
-                # 对象形式（有 type 属性）
-                if hasattr(comp, "type") and comp.type == "reply":
-                    return str(comp.data.get("id", "") if hasattr(comp, "data") else "")
-                # dict 形式
-                if isinstance(comp, dict):
-                    if comp.get("type") == "reply":
-                        return str(comp.get("data", {}).get("id", ""))
-        except Exception:
-            pass
-        try:
-            raw_str = str(event.message_obj.raw_message)
-            match = self._CQ_REPLY_RE.search(raw_str)
-            if match:
-                return match.group(1)
-        except Exception:
-            pass
-        try:
-            raw_str = str(event.message_obj.raw_message)
-            match = self._MSG_ID_RE.search(raw_str)
-            if match:
-                return match.group(1)
-        except Exception:
-            pass
+        for candidate in (
+            getattr(event, "message_obj", None),
+            getattr(getattr(event, "message_obj", None), "message", None),
+            getattr(getattr(event, "message_obj", None), "raw_message", None),
+            event,
+        ):
+            try:
+                reply_id = self._extract_reply_id_from_node(candidate, set())
+                if reply_id:
+                    return reply_id
+            except Exception:
+                continue
         return None
 
     def _find_flag_by_msg_id(self, msg_id: str) -> Optional[str]:
-        if not msg_id:
+        target_msg_id = self._normalize_msg_id(msg_id)
+        if not target_msg_id:
             return None
         for flag, info in self.pending.items():
-            if msg_id in info.get("notify_ids", []):
+            notify_ids = {
+                normalized
+                for normalized in (
+                    self._normalize_msg_id(item) for item in info.get("notify_ids", [])
+                )
+                if normalized
+            }
+            if target_msg_id in notify_ids:
                 return flag
         return None
 
@@ -612,14 +722,9 @@ class RelationshipManager(Star):
         lines = ["📋 好友列表"]
         for i, f in enumerate(friends, 1):
             uid = f.get("user_id", "?")
-            nickname = f.get("nickname", "?")
-            remark = f.get("remark", "")
-            # 显示备注名（如果有）
-            display_name = f"{remark}({nickname})" if remark and remark != nickname else nickname
             tag = " 🚫" if self._blocked(str(uid)) else ""
-            lines.append(f"{i}. {display_name} ({uid}){tag}")
+            lines.append(f"{i}. {f.get('nickname', '?')} ({uid}){tag}")
 
-        lines.append(f"\n💡 共 {len(friends)} 人")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("群", alias=["gl"])
@@ -651,12 +756,9 @@ class RelationshipManager(Star):
         lines = ["📋 群列表"]
         for i, g in enumerate(groups, 1):
             gid = g.get('group_id', '?')
-            group_name = g.get('group_name', '?')
-            member_count = g.get('member_count', '?')
             tag = " 🚫" if self._is_group_blocked(str(gid)) else ""
-            lines.append(f"{i}. {group_name} ({gid}) {member_count}人{tag}")
+            lines.append(f"{i}. {g.get('group_name', '?')} ({gid}){tag}")
 
-        lines.append(f"\n💡 共 {len(groups)} 个群")
         yield event.plain_result("\n".join(lines))
 
     # ───────── 黑名单 ─────────
@@ -671,6 +773,10 @@ class RelationshipManager(Star):
 
         uids = self._ids(args)
         if not uids:
+            if self._get_reply_id(event):
+                async for result in self._process_reply(event, action="block"):
+                    yield result
+                return
             yield event.plain_result("⚠️ /拉黑 12345 [67890] ...  或引用通知消息回复 /拉黑")
             return
 
