@@ -259,6 +259,14 @@ class RelationshipManager(Star):
             logger.error(f"API {name} 失败: {e}")
         return None
 
+    @staticmethod
+    def _api_ok(res: Any) -> bool:
+        if not isinstance(res, dict):
+            return False
+        status = str(res.get("status", "")).lower()
+        retcode = res.get("retcode")
+        return status == "ok" or retcode == 0
+
     async def _notify(self, msg: str):
         """修复7: 委托给 _notify_with_ids，忽略返回值"""
         await self._notify_with_ids(msg)
@@ -760,6 +768,124 @@ class RelationshipManager(Star):
             if flag:
                 return flag
 
+        return None
+
+    def _extract_ids_from_notice_like_text(self, text: str) -> List[str]:
+        ids = []
+        for candidate in self._extract_pending_candidates_from_text(text):
+            if self._valid_uid(candidate) and candidate not in ids:
+                ids.append(candidate)
+        return ids
+
+    def _iter_dicts(self, node: Any):
+        seen: Set[int] = set()
+
+        def walk(current: Any):
+            if current is None:
+                return
+            if isinstance(current, str):
+                stripped = current.strip()
+                if stripped[:1] in ("{", "["):
+                    try:
+                        current = json.loads(stripped)
+                    except Exception:
+                        return
+                else:
+                    return
+            if isinstance(current, (int, float, bool, bytes)):
+                return
+
+            current_id = id(current)
+            if current_id in seen:
+                return
+            seen.add(current_id)
+
+            if isinstance(current, dict):
+                yield current
+                for value in current.values():
+                    yield from walk(value)
+                return
+
+            if isinstance(current, (list, tuple, set)):
+                for item in current:
+                    yield from walk(item)
+
+        yield from walk(node)
+
+    async def _find_live_friend_request_by_text(
+        self, event: AstrMessageEvent, text: str
+    ) -> Optional[tuple[str, dict]]:
+        target_uids = set(self._extract_ids_from_notice_like_text(text))
+        if not target_uids:
+            return None
+
+        # NapCat exposes pending/suspicious friend requests through this action.
+        for action_name in ("get_doubt_friends_add_request", "get_friend_system_msg"):
+            try:
+                res = await self._api(action_name, event=event, count=20)
+            except Exception as e:
+                logger.warning(f"查询好友申请列表失败: action={action_name}, err={e}")
+                continue
+            if not res:
+                continue
+
+            seen_candidates = []
+            for item in self._iter_dicts(res):
+                uid = self._normalize_msg_id(
+                    item.get("user_id")
+                    or item.get("uin")
+                    or item.get("requester_uin")
+                    or item.get("account")
+                    or item.get("from_uin")
+                )
+                flag = self._normalize_msg_id(item.get("flag") or item.get("seq") or item.get("request_id"))
+                if uid and flag:
+                    seen_candidates.append((uid, flag))
+                if uid in target_uids and flag:
+                    info = dict(
+                        type="friend",
+                        user_id=uid,
+                        nickname=str(item.get("nickname") or item.get("nick") or uid),
+                        comment=str(item.get("comment") or item.get("reason") or ""),
+                        time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        notify_ids=[],
+                        live_lookup=True,
+                        request_api="set_doubt_friends_add_request"
+                        if action_name == "get_doubt_friends_add_request"
+                        else "set_friend_add_request",
+                    )
+                    logger.info(f"实时匹配好友申请: action={action_name}, uid={uid}, flag={flag}")
+                    return flag, info
+
+            if seen_candidates:
+                logger.info(
+                    "实时好友申请列表已查询但未命中: action=%s, target_uids=%s, candidates=%s",
+                    action_name,
+                    sorted(target_uids),
+                    seen_candidates[:10],
+                )
+
+        logger.warning(f"实时好友申请列表未匹配到通知中的QQ: target_uids={sorted(target_uids)}")
+        return None
+
+    async def _find_live_friend_request_by_replied_message(
+        self, event: AstrMessageEvent, reply_id: str
+    ) -> Optional[tuple[str, dict]]:
+        if not reply_id:
+            return None
+
+        try:
+            res = await self._api("get_msg", event=event, message_id=int(reply_id))
+        except ValueError:
+            res = await self._api("get_msg", event=event, message_id=reply_id)
+        except Exception as e:
+            logger.warning(f"拉取引用消息用于实时申请匹配失败: reply_id={reply_id}, err={e}")
+            return None
+
+        for text in self._collect_text_fragments(res):
+            matched = await self._find_live_friend_request_by_text(event, text)
+            if matched:
+                return matched
         return None
 
     def _collect_text_fragments(self, node: Any) -> List[str]:
@@ -1525,13 +1651,27 @@ class RelationshipManager(Star):
             yield event.plain_result("❌ 仅管理员可用")
             return
 
+        try:
+            event.stop_event()
+        except Exception:
+            pass
+
         flag = self._find_flag_from_args(args)
+        live_info = None
         reply_id = self._get_reply_id(event) if not flag else None
         flag = flag or (self._find_flag_by_msg_id(reply_id) if reply_id else None)
         if not flag:
             flag = self._find_flag_by_quote_text(event)
         if not flag and reply_id:
             flag = await self._find_flag_by_replied_message(event, reply_id)
+        if not flag and args:
+            live_match = await self._find_live_friend_request_by_text(event, args)
+            if live_match:
+                flag, live_info = live_match
+        if not flag and reply_id:
+            live_match = await self._find_live_friend_request_by_replied_message(event, reply_id)
+            if live_match:
+                flag, live_info = live_match
         if not flag:
             if args:
                 yield event.plain_result("❌ 未匹配到对应待处理编号")
@@ -1545,7 +1685,7 @@ class RelationshipManager(Star):
             yield event.plain_result("❌ 该引用消息未匹配到待处理请求")
             return
 
-        info = self.pending.get(flag)
+        info = self.pending.get(flag) or live_info
         if not info:
             yield event.plain_result("❌ 该请求已过期或已处理")
             return
@@ -1563,14 +1703,26 @@ class RelationshipManager(Star):
         if action == "block":
             try:
                 if info["type"] == "friend":
-                    await self._api("set_friend_add_request", event=event, flag=flag, approve=False)
+                    r = await self._api(
+                        info.get("request_api", "set_friend_add_request"),
+                        event=event,
+                        flag=flag,
+                        approve=False,
+                    )
                 else:
-                    await self._api(
+                    r = await self._api(
                         "set_group_add_request", event=event, flag=flag, approve=False,
                         sub_type=info.get("sub_type", "invite"),
                     )
             except Exception as e:
                 logger.error(f"拒绝 {flag} 异常: {e}")
+                yield event.plain_result("❌ 操作异常，请查看日志")
+                return
+
+            if not self._api_ok(r):
+                logger.warning(f"拒绝并拉黑失败: flag={flag}, response={r}")
+                yield event.plain_result("❌ 拒绝请求失败，未写入黑名单；请查看平台返回")
+                return
 
             # 修复3: _add_to_blacklist 现在是 async，加 await
             if uid and uid != "0":
@@ -1589,14 +1741,19 @@ class RelationshipManager(Star):
         approve = (action == "accept")
         try:
             if info["type"] == "friend":
-                r = await self._api("set_friend_add_request", event=event, flag=flag, approve=approve)
+                r = await self._api(
+                    info.get("request_api", "set_friend_add_request"),
+                    event=event,
+                    flag=flag,
+                    approve=approve,
+                )
             else:
                 r = await self._api(
                     "set_group_add_request", event=event, flag=flag, approve=approve,
                     sub_type=info.get("sub_type", "invite"),
                 )
 
-            if r and r.get("status") == "ok":
+            if self._api_ok(r):
                 async with self._lock:
                     self.pending.pop(flag, None)
                     self._save(self.pd_file, self.pending)
@@ -1609,17 +1766,17 @@ class RelationshipManager(Star):
             logger.error(f"处理 {flag} 异常: {e}")
             yield event.plain_result("❌ 操作异常，请查看日志")
 
-    @filter.command("同意", alias=["accept"])
+    @filter.command("同意", alias=["accept"], priority=1, block=True)
     async def cmd_accept(self, event: AstrMessageEvent, args: str = ""):
         async for result in self._process_reply(event, action="accept", args=args):
             yield result
 
-    @filter.command("拒绝", alias=["reject"])
+    @filter.command("拒绝", alias=["reject"], priority=1, block=True)
     async def cmd_reject(self, event: AstrMessageEvent, args: str = ""):
         async for result in self._process_reply(event, action="reject", args=args):
             yield result
 
-    @filter.command("拉黑请求", alias=["blockreply"])
+    @filter.command("拉黑请求", alias=["blockreply"], priority=1, block=True)
     async def cmd_block_reply(self, event: AstrMessageEvent, args: str = ""):
         async for result in self._process_reply(event, action="block", args=args):
             yield result
