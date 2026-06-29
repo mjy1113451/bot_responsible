@@ -40,9 +40,9 @@ except ImportError:
 class RelationshipManager(Star):
 
     # OneBot v11 CQ 码
-    _CQ_REPLY_RE = re.compile(r"\[CQ:reply,id=(\d+)\]")
+    _CQ_REPLY_RE = re.compile(r"\[CQ:reply,id=(-?\d+)\]")
     # OneBot v12 / 标准 reply 结构匹配
-    _MSG_ID_RE = re.compile(r'"message_id"\s*:\s*"?(\d+)"?')
+    _MSG_ID_RE = re.compile(r'"message_id"\s*:\s*"?(-?\d+)"?')
     _REPLY_ID_KEYS = ("id", "message_id", "messageId", "msg_id", "msgId")
     _REPLY_CONTAINER_KEYS = ("reply", "source", "quote", "message_reference")
     _REPLY_TYPE_NAMES = ("reply", "source", "quote")
@@ -232,6 +232,8 @@ class RelationshipManager(Star):
                 client = event.bot
                 if client and hasattr(client, name):
                     return await getattr(client, name)(**kw)
+                if client and hasattr(client, "api") and hasattr(client.api, "call_action"):
+                    return await client.api.call_action(name, **kw)
 
             # 方式2: 通过平台获取客户端
             if event:
@@ -241,6 +243,8 @@ class RelationshipManager(Star):
                     client = platform.get_client()
                     if client and hasattr(client, name):
                         return await getattr(client, name)(**kw)
+                    if client and hasattr(client, "api") and hasattr(client.api, "call_action"):
+                        return await client.api.call_action(name, **kw)
 
             # 方式3: 遍历所有平台查找支持的客户端
             for platform in self.context.platform_manager.get_insts():
@@ -248,6 +252,8 @@ class RelationshipManager(Star):
                     client = platform.get_client()
                     if client and hasattr(client, name):
                         return await getattr(client, name)(**kw)
+                    if client and hasattr(client, "api") and hasattr(client.api, "call_action"):
+                        return await client.api.call_action(name, **kw)
 
         except Exception as e:
             logger.error(f"API {name} 失败: {e}")
@@ -638,6 +644,32 @@ class RelationshipManager(Star):
                 return flag
         return None
 
+    def _find_flag_by_notice_text(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+        if "好友申请" not in text and "群邀请" not in text:
+            return None
+
+        candidates = self._extract_pending_candidates_from_text(text)
+        if not candidates:
+            return None
+
+        for flag, info in reversed(list(self.pending.items())):
+            request_id = str(info.get("request_id", "")).strip()
+            values = {
+                str(info.get("user_id", "")).strip(),
+                str(info.get("group_id", "")).strip(),
+                str(info.get("nickname", "")).strip(),
+                str(info.get("inviter_nickname", "")).strip(),
+                str(info.get("group_name", "")).strip(),
+                request_id,
+                str(flag).strip(),
+            }
+            if any(candidate in values for candidate in candidates):
+                return flag
+
+        return None
+
     def _find_flag_from_args(self, args: str) -> Optional[str]:
         text = str(args or "").strip()
         if not text:
@@ -699,26 +731,34 @@ class RelationshipManager(Star):
             pass
 
         for text in texts:
-            if "好友申请" not in text and "群邀请" not in text:
-                continue
+            flag = self._find_flag_by_notice_text(text)
+            if flag:
+                return flag
 
-            candidates = self._extract_pending_candidates_from_text(text)
-            if not candidates:
-                continue
+        return None
 
-            for flag, info in reversed(list(self.pending.items())):
-                request_id = str(info.get("request_id", "")).strip()
-                values = {
-                    str(info.get("user_id", "")).strip(),
-                    str(info.get("group_id", "")).strip(),
-                    str(info.get("nickname", "")).strip(),
-                    str(info.get("inviter_nickname", "")).strip(),
-                    str(info.get("group_name", "")).strip(),
-                    request_id,
-                    str(flag).strip(),
-                }
-                if any(candidate in values for candidate in candidates):
-                    return flag
+    async def _find_flag_by_replied_message(self, event: AstrMessageEvent, reply_id: str) -> Optional[str]:
+        if not reply_id:
+            return None
+
+        try:
+            res = await self._api("get_msg", event=event, message_id=int(reply_id))
+        except ValueError:
+            res = await self._api("get_msg", event=event, message_id=reply_id)
+        except Exception as e:
+            logger.warning(f"拉取引用消息失败: reply_id={reply_id}, err={e}")
+            return None
+
+        if not res:
+            logger.warning(f"拉取引用消息无结果: reply_id={reply_id}")
+            return None
+
+        texts = self._collect_text_fragments(res)
+        logger.info(f"已拉取引用消息用于匹配: reply_id={reply_id}, text_fragments={len(texts)}")
+        for text in texts:
+            flag = self._find_flag_by_notice_text(text)
+            if flag:
+                return flag
 
         return None
 
@@ -1490,12 +1530,17 @@ class RelationshipManager(Star):
         flag = flag or (self._find_flag_by_msg_id(reply_id) if reply_id else None)
         if not flag:
             flag = self._find_flag_by_quote_text(event)
+        if not flag and reply_id:
+            flag = await self._find_flag_by_replied_message(event, reply_id)
         if not flag:
             if args:
                 yield event.plain_result("❌ 未匹配到对应待处理编号")
                 return
             if not reply_id:
                 yield event.plain_result("⚠️ 请引用通知消息回复 /同意 或 /拒绝 或 /拉黑，或使用 /同意 编号")
+                return
+            if not self.pending:
+                yield event.plain_result("❌ 当前没有待处理请求记录；请确认好友申请事件已被插件捕获并写入 pending")
                 return
             yield event.plain_result("❌ 该引用消息未匹配到待处理请求")
             return
