@@ -34,7 +34,7 @@ except ImportError:
     "astrbot_plugin_relationship_manager",
     "mjy1113451",
     "AstrBot 关系管理插件",
-    "5.2.0",
+    "5.2.1",
     "https://github.com/mjy1113451/bot_responsible",
 )
 class RelationshipManager(Star):
@@ -68,15 +68,54 @@ class RelationshipManager(Star):
 
         self.notify_group: Optional[str] = config.get("notify_group", None)
         self._lock = asyncio.Lock()
+        self._patch_astrbot_message_session_id()
         self._cleanup_pending()
         logger.info(
-            "关系管理插件初始化完成: data_dir=%s, pending_file=%s, pending_count=%s",
+            "关系管理插件初始化完成 v5.2.1-snowluma-direct-uin: data_dir=%s, pending_file=%s, pending_count=%s",
             self.data_dir,
             self.pd_file,
             len(self.pending),
         )
 
     # ───────── 持久化 ─────────
+
+    @staticmethod
+    def _patch_astrbot_message_session_id():
+        """
+        SnowLuma/OneBot request events may be wrapped as AstrBotMessage without
+        a session_id. AstrBot may access it before plugin code runs, so patch
+        the message class once to give request/notice wrappers a safe default.
+        """
+        try:
+            from astrbot.core.platform.astrbot_message import AstrBotMessage
+        except Exception as e:
+            logger.warning(f"无法加载 AstrBotMessage，跳过 session_id 兼容补丁: {e}")
+            return
+
+        if getattr(AstrBotMessage, "_relationship_manager_session_patch", False):
+            return
+
+        original_init = AstrBotMessage.__init__
+
+        def patched_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            if getattr(self, "session_id", None):
+                return
+            raw = getattr(self, "raw_message", None)
+            if isinstance(raw, dict):
+                group_id = raw.get("group_id")
+                user_id = raw.get("user_id")
+                if group_id:
+                    self.session_id = str(group_id)
+                    return
+                if user_id:
+                    self.session_id = str(user_id)
+                    return
+            self.session_id = "unknown_session"
+
+        AstrBotMessage.__init__ = patched_init
+        AstrBotMessage._relationship_manager_session_patch = True
+        logger.info("已启用 SnowLuma/OneBot request 事件 session_id 兼容补丁")
 
     @staticmethod
     def _load(path: Path, default):
@@ -652,6 +691,45 @@ class RelationshipManager(Star):
                 return flag
         return None
 
+    @staticmethod
+    def _api_data(res: Any) -> Any:
+        if not isinstance(res, dict):
+            return None
+        if "data" in res:
+            return res.get("data")
+        return res
+
+    def _api_list(self, res: Any) -> List[dict]:
+        data = self._api_data(res)
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            for key in ("requests", "list", "items", "data"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+        return []
+
+    def _find_pending_by_fields(self, fields: List[str]) -> Optional[str]:
+        values = {str(field).strip() for field in fields if str(field or "").strip()}
+        if not values:
+            return None
+        for flag, info in reversed(list(self.pending.items())):
+            known = {
+                str(flag).strip(),
+                str(info.get("request_id", "")).strip(),
+                str(info.get("request_flag", "")).strip(),
+                str(info.get("user_id", "")).strip(),
+                str(info.get("nickname", "")).strip(),
+                str(info.get("group_id", "")).strip(),
+                str(info.get("group_name", "")).strip(),
+                str(info.get("inviter_nickname", "")).strip(),
+                str(info.get("comment", "")).strip(),
+            }
+            if values & known:
+                return flag
+        return None
+
     def _find_flag_by_notice_text(self, text: str) -> Optional[str]:
         if not text:
             return None
@@ -677,6 +755,107 @@ class RelationshipManager(Star):
                 return flag
 
         return None
+
+    async def _sync_snowluma_pending_requests(self, event: AstrMessageEvent = None) -> int:
+        """
+        SnowLuma normal requests arrive as OneBot request events. Some QQ-side
+        filtered requests only appear in SnowLuma's extended list actions; sync
+        those into the same pending table so /同意 /拒绝 can process them by id.
+        """
+        added = 0
+        added += await self._sync_snowluma_doubt_friend_requests(event)
+        added += await self._sync_snowluma_filtered_group_requests(event)
+        return added
+
+    async def _sync_snowluma_doubt_friend_requests(self, event: AstrMessageEvent = None) -> int:
+        res = await self._api("get_doubt_friends_add_request", event=event, count=50)
+        if not self._api_ok(res):
+            logger.info(f"SnowLuma 可疑好友申请列表不可用或为空: response={res}")
+            return 0
+
+        added = 0
+        for item in self._api_list(res):
+            flag = str(item.get("uid", "")).strip()
+            if not flag:
+                continue
+            nick = str(item.get("nick", "") or flag).strip()
+            comment = str(item.get("msg", "") or "").strip()
+            source = str(item.get("source", "") or "").strip()
+            req_time = item.get("reqTime")
+
+            async with self._lock:
+                if flag in self.pending:
+                    continue
+                existing = self._find_pending_by_fields([flag, nick, comment])
+                if existing:
+                    continue
+                request_id = self._new_request_id()
+                self.pending[flag] = dict(
+                    type="friend",
+                    user_id=flag,
+                    nickname=nick,
+                    comment=comment,
+                    source=source,
+                    time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    req_time=req_time,
+                    notify_ids=[],
+                    request_id=request_id,
+                    request_flag=flag,
+                    request_type="friend",
+                    request_api="set_doubt_friends_add_request",
+                    snowluma_doubt=True,
+                )
+                self._save(self.pd_file, self.pending)
+                added += 1
+                logger.info(f"已同步 SnowLuma 可疑好友申请: flag={flag}, request_id={request_id}, nick={nick}")
+        return added
+
+    async def _sync_snowluma_filtered_group_requests(self, event: AstrMessageEvent = None) -> int:
+        res = await self._api("get_group_ignored_notifies", event=event)
+        if not self._api_ok(res):
+            logger.info(f"SnowLuma 被过滤入群请求列表不可用或为空: response={res}")
+            return 0
+
+        added = 0
+        for item in self._api_list(res):
+            if item.get("checked") is True:
+                continue
+            flag = str(item.get("flag", "")).strip()
+            gid = str(item.get("group_id", "") or "").strip()
+            uid = str(item.get("requester_uin", "") or item.get("invitor_uin", "") or "0").strip()
+            if not flag or not gid:
+                continue
+            group_name = str(item.get("group_name", "") or gid).strip()
+            inviter_nickname = str(item.get("invitor_nick", "") or uid).strip()
+            comment = str(item.get("message", "") or "").strip()
+
+            async with self._lock:
+                if flag in self.pending:
+                    continue
+                existing = self._find_pending_by_fields([flag, gid, uid, group_name, inviter_nickname, comment])
+                if existing:
+                    continue
+                request_id = self._new_request_id()
+                self.pending[flag] = dict(
+                    type="group",
+                    group_id=gid,
+                    group_name=group_name,
+                    user_id=uid,
+                    inviter_nickname=inviter_nickname,
+                    sub_type="add",
+                    comment=comment,
+                    time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    notify_ids=[],
+                    request_id=request_id,
+                    request_flag=flag,
+                    request_type="group",
+                    request_api="set_group_add_request",
+                    snowluma_filtered=True,
+                )
+                self._save(self.pd_file, self.pending)
+                added += 1
+                logger.info(f"已同步 SnowLuma 被过滤入群请求: flag={flag}, request_id={request_id}, gid={gid}, uid={uid}")
+        return added
 
     def _find_flag_from_args(self, args: str) -> Optional[str]:
         text = str(args or "").strip()
@@ -749,20 +928,7 @@ class RelationshipManager(Star):
         if not reply_id:
             return None
 
-        try:
-            res = await self._api("get_msg", event=event, message_id=int(reply_id))
-        except ValueError:
-            res = await self._api("get_msg", event=event, message_id=reply_id)
-        except Exception as e:
-            logger.warning(f"拉取引用消息失败: reply_id={reply_id}, err={e}")
-            return None
-
-        if not res:
-            logger.warning(f"拉取引用消息无结果: reply_id={reply_id}")
-            return None
-
-        texts = self._collect_text_fragments(res)
-        logger.info(f"已拉取引用消息用于匹配: reply_id={reply_id}, text_fragments={len(texts)}")
+        texts = await self._collect_replied_message_texts(event, reply_id)
         for text in texts:
             flag = self._find_flag_by_notice_text(text)
             if flag:
@@ -776,6 +942,76 @@ class RelationshipManager(Star):
             if self._valid_uid(candidate) and candidate not in ids:
                 ids.append(candidate)
         return ids
+
+    def _extract_friend_request_from_notice_text(self, text: str) -> Optional[dict]:
+        if not text or "好友申请" not in text:
+            return None
+        ids = self._extract_ids_from_notice_like_text(text)
+        if not ids:
+            return None
+        uid = ids[0]
+        nickname = uid
+        comment = ""
+        nick_match = re.search(r"昵称[:：]\s*([^\n\r]+)", text)
+        if nick_match:
+            nickname = nick_match.group(1).strip() or uid
+        comment_match = re.search(r"验证(?:信息|消息)?[:：]\s*([^\n\r]+)", text)
+        if comment_match:
+            comment = comment_match.group(1).strip()
+        return dict(
+            type="friend",
+            user_id=uid,
+            nickname=nickname,
+            comment=comment,
+            time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            notify_ids=[],
+            request_id=uid,
+            request_flag=uid,
+            request_type="friend",
+            request_api="set_friend_add_request",
+            snowluma_direct_uin=True,
+        )
+
+    async def _collect_replied_message_texts(self, event: AstrMessageEvent, reply_id: str) -> List[str]:
+        if not reply_id:
+            return []
+        try:
+            try:
+                res = await self._api("get_msg", event=event, message_id=int(reply_id))
+            except ValueError:
+                res = await self._api("get_msg", event=event, message_id=reply_id)
+        except Exception as e:
+            logger.warning(f"拉取引用消息失败: reply_id={reply_id}, err={e}")
+            return []
+        if not res:
+            logger.warning(f"拉取引用消息无结果: reply_id={reply_id}")
+            return []
+        texts = self._collect_text_fragments(res)
+        logger.info(f"已拉取引用消息用于匹配: reply_id={reply_id}, text_fragments={len(texts)}")
+        return texts
+
+    async def _recover_friend_request_from_notice(
+        self, event: AstrMessageEvent, reply_id: str = None
+    ) -> Optional[dict]:
+        texts: List[str] = []
+        for candidate in (
+            event,
+            getattr(event, "message_obj", None),
+            getattr(getattr(event, "message_obj", None), "message", None),
+            getattr(getattr(event, "message_obj", None), "raw_message", None),
+        ):
+            for text in self._collect_text_fragments(candidate):
+                if text and text not in texts:
+                    texts.append(text)
+        if reply_id:
+            for text in await self._collect_replied_message_texts(event, reply_id):
+                if text and text not in texts:
+                    texts.append(text)
+        for text in texts:
+            info = self._extract_friend_request_from_notice_text(text)
+            if info:
+                return info
+        return None
 
     def _iter_dicts(self, node: Any):
         seen: Set[int] = set()
@@ -811,83 +1047,6 @@ class RelationshipManager(Star):
                     yield from walk(item)
 
         yield from walk(node)
-
-    async def _find_live_friend_request_by_text(
-        self, event: AstrMessageEvent, text: str
-    ) -> Optional[tuple[str, dict]]:
-        target_uids = set(self._extract_ids_from_notice_like_text(text))
-        if not target_uids:
-            return None
-
-        # NapCat exposes filtered/suspicious friend requests through this action.
-        # There is no official get_friend_system_msg action in current NapCat.
-        for action_name in ("get_doubt_friends_add_request",):
-            try:
-                res = await self._api(action_name, event=event, count=50)
-                if not res:
-                    res = await self._api(action_name, event=event)
-            except Exception as e:
-                logger.warning(f"查询好友申请列表失败: action={action_name}, err={e}")
-                continue
-            if not res:
-                continue
-
-            seen_candidates = []
-            for item in self._iter_dicts(res):
-                uid = self._normalize_msg_id(
-                    item.get("user_id")
-                    or item.get("uin")
-                    or item.get("requester_uin")
-                    or item.get("account")
-                    or item.get("from_uin")
-                )
-                flag = self._normalize_msg_id(item.get("flag") or item.get("seq") or item.get("request_id"))
-                if uid and flag:
-                    seen_candidates.append((uid, flag))
-                if uid in target_uids and flag:
-                    info = dict(
-                        type="friend",
-                        user_id=uid,
-                        nickname=str(item.get("nickname") or item.get("nick") or uid),
-                        comment=str(item.get("comment") or item.get("reason") or ""),
-                        time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        notify_ids=[],
-                        live_lookup=True,
-                        request_api="set_doubt_friends_add_request",
-                    )
-                    logger.info(f"实时匹配好友申请: action={action_name}, uid={uid}, flag={flag}")
-                    return flag, info
-
-            if seen_candidates:
-                logger.info(
-                    "实时好友申请列表已查询但未命中: action=%s, target_uids=%s, candidates=%s",
-                    action_name,
-                    sorted(target_uids),
-                    seen_candidates[:10],
-                )
-
-        logger.warning(f"实时好友申请列表未匹配到通知中的QQ: target_uids={sorted(target_uids)}")
-        return None
-
-    async def _find_live_friend_request_by_replied_message(
-        self, event: AstrMessageEvent, reply_id: str
-    ) -> Optional[tuple[str, dict]]:
-        if not reply_id:
-            return None
-
-        try:
-            res = await self._api("get_msg", event=event, message_id=int(reply_id))
-        except ValueError:
-            res = await self._api("get_msg", event=event, message_id=reply_id)
-        except Exception as e:
-            logger.warning(f"拉取引用消息用于实时申请匹配失败: reply_id={reply_id}, err={e}")
-            return None
-
-        for text in self._collect_text_fragments(res):
-            matched = await self._find_live_friend_request_by_text(event, text)
-            if matched:
-                return matched
-        return None
 
     def _collect_text_fragments(self, node: Any) -> List[str]:
         texts: List[str] = []
@@ -1423,31 +1582,35 @@ class RelationshipManager(Star):
             yield event.plain_result("❌ 仅管理员可用")
             return
 
+        synced = await self._sync_snowluma_pending_requests(event)
         async with self._lock:
             self._cleanup_pending()
             pending_snapshot = dict(self.pending)
-        logger.info(f"待处理查询: pending_count={len(pending_snapshot)}, file={self.pd_file}")
+        logger.info(f"待处理查询: pending_count={len(pending_snapshot)}, synced={synced}, file={self.pd_file}")
 
         if not pending_snapshot:
-            yield event.plain_result("📋 无待处理请求")
+            yield event.plain_result("📋 无待处理请求\nSnowLuma 标准 request 事件和扩展过滤列表均未发现未处理申请")
             return
 
-        lines = ["📋 待处理请求（引用对应消息回复 /同意 或 /拒绝 或 /拉黑）"]
+        lines = ["📋 待处理请求（引用对应消息回复 /同意 或 /拒绝 或 /拉黑，或使用编号）"]
         for flag, info in pending_snapshot.items():
             t = info.get("time", "?")
             request_id = info.get("request_id", flag)
             if info["type"] == "friend":
                 nickname = info.get('nickname', info['user_id'])
                 comment = info.get('comment') or '无'
+                label = "可疑好友" if info.get("snowluma_doubt") else "好友"
+                id_label = "UID" if info.get("snowluma_doubt") else "QQ"
                 lines.append(
-                    f"🔹 好友 | 编号:{request_id} | 昵称:{nickname} QQ:{info['user_id']} | 验证:{comment} | {t}"
+                    f"🔹 {label} | 编号:{request_id} | 昵称:{nickname} {id_label}:{info['user_id']} | 验证:{comment} | {t}"
                 )
             else:
                 inviter_nickname = info.get('inviter_nickname', info['user_id'])
                 group_name = info.get('group_name', info['group_id'])
                 comment = info.get('comment') or '无'
+                label = "过滤入群" if info.get("snowluma_filtered") else "群邀"
                 lines.append(
-                    f"🔸 群邀 | 编号:{request_id} | 群:{group_name}({info['group_id']}) | 邀请人:{inviter_nickname}({info['user_id']}) | 验证:{comment} | {t}"
+                    f"🔸 {label} | 编号:{request_id} | 群:{group_name}({info['group_id']}) | 邀请人:{inviter_nickname}({info['user_id']}) | 验证:{comment} | {t}"
                 )
 
         yield event.plain_result("\n".join(lines))
@@ -1497,6 +1660,9 @@ class RelationshipManager(Star):
         if not client:
             yield event.plain_result("❌ 无法获取客户端")
             return
+        if ExpansionHandle is None:
+            yield event.plain_result("❌ 扩展 Packet 模块不可用，SnowLuma 没有标准 OneBot 主动加好友 action")
+            return
 
         try:
             self_id = int(event.get_self_id())
@@ -1514,10 +1680,9 @@ class RelationshipManager(Star):
             # 检查是否是 Packet 超时错误
             if "timeout" in str(e).lower() or "sendPacket" in str(e):
                 yield event.plain_result(
-                    f"⚠️ Packet 服务超时，可能原因：\n"
-                    f"1. NapCat PacketServer 未正确配置\n"
-                    f"2. 当前 NapCat 版本不支持此命令\n"
-                    f"3. 网络连接问题\n\n"
+                    f"⚠️ SnowLuma send_packet 调用超时或失败。\n"
+                    f"SnowLuma 没有标准 OneBot 主动加好友 action，本命令只能走实验性原始包，"
+                    f"不同 QQ/SnowLuma 版本可能不可用。\n\n"
                     f"请手动在 QQ 上添加好友: {uid}"
                 )
             else:
@@ -1568,6 +1733,9 @@ class RelationshipManager(Star):
         if not client:
             yield event.plain_result("❌ 无法获取客户端")
             return
+        if ExpansionHandle is None:
+            yield event.plain_result("❌ 扩展 Packet 模块不可用，SnowLuma 没有标准 OneBot 主动加群 action")
+            return
 
         try:
             target_gid = int(gid)
@@ -1582,10 +1750,9 @@ class RelationshipManager(Star):
             # 检查是否是 Packet 超时错误
             if "timeout" in str(e).lower() or "sendPacket" in str(e):
                 yield event.plain_result(
-                    f"⚠️ Packet 服务超时，可能原因：\n"
-                    f"1. NapCat PacketServer 未正确配置\n"
-                    f"2. 当前 NapCat 版本不支持此命令\n"
-                    f"3. 网络连接问题\n\n"
+                    f"⚠️ SnowLuma send_packet 调用超时或失败。\n"
+                    f"SnowLuma 没有标准 OneBot 主动加群 action，本命令只能走实验性原始包，"
+                    f"不同 QQ/SnowLuma 版本可能不可用。\n\n"
                     f"请手动在 QQ 上加入群: {gid}"
                 )
             else:
@@ -1658,21 +1825,34 @@ class RelationshipManager(Star):
             pass
 
         flag = self._find_flag_from_args(args)
-        live_info = None
         reply_id = self._get_reply_id(event) if not flag else None
         flag = flag or (self._find_flag_by_msg_id(reply_id) if reply_id else None)
         if not flag:
             flag = self._find_flag_by_quote_text(event)
         if not flag and reply_id:
             flag = await self._find_flag_by_replied_message(event, reply_id)
-        if not flag and args:
-            live_match = await self._find_live_friend_request_by_text(event, args)
-            if live_match:
-                flag, live_info = live_match
-        if not flag and reply_id:
-            live_match = await self._find_live_friend_request_by_replied_message(event, reply_id)
-            if live_match:
-                flag, live_info = live_match
+        if not flag:
+            synced = await self._sync_snowluma_pending_requests(event)
+            if synced:
+                logger.info(f"审批命令触发 SnowLuma 扩展列表同步: synced={synced}")
+                flag = self._find_flag_from_args(args)
+                if not flag and reply_id:
+                    flag = self._find_flag_by_msg_id(reply_id)
+                if not flag:
+                    flag = self._find_flag_by_quote_text(event)
+                if not flag and reply_id:
+                    flag = await self._find_flag_by_replied_message(event, reply_id)
+        recovered_info = None
+        if not flag:
+            recovered_info = await self._recover_friend_request_from_notice(event, reply_id)
+            if recovered_info:
+                flag = recovered_info["request_flag"]
+                logger.info(
+                    "从引用通知恢复 SnowLuma 好友申请: flag=%s, uid=%s, nickname=%s",
+                    flag,
+                    recovered_info.get("user_id"),
+                    recovered_info.get("nickname"),
+                )
         if not flag:
             if args:
                 yield event.plain_result("❌ 未匹配到对应待处理编号")
@@ -1681,12 +1861,12 @@ class RelationshipManager(Star):
                 yield event.plain_result("⚠️ 请引用通知消息回复 /同意 或 /拒绝 或 /拉黑，或使用 /同意 编号")
                 return
             if not self.pending:
-                yield event.plain_result("❌ 当前没有待处理请求记录；请确认好友申请事件已被插件捕获并写入 pending")
+                yield event.plain_result("❌ 当前没有待处理请求记录；SnowLuma 标准 request 事件和扩展过滤列表均未发现未处理申请")
                 return
             yield event.plain_result("❌ 该引用消息未匹配到待处理请求")
             return
 
-        info = self.pending.get(flag) or live_info
+        info = self.pending.get(flag) or recovered_info
         if not info:
             yield event.plain_result("❌ 该请求已过期或已处理")
             return
@@ -1695,7 +1875,8 @@ class RelationshipManager(Star):
         kind = "好友申请" if info["type"] == "friend" else "群邀请"
         if info["type"] == "friend":
             nickname = info.get("nickname", uid)
-            target = f"昵称：{nickname}\nQQ号：{uid}"
+            id_label = "UID" if info.get("snowluma_doubt") else "QQ号"
+            target = f"昵称：{nickname}\n{id_label}：{uid}"
         else:
             inviter_nickname = info.get('inviter_nickname', uid)
             group_name = info.get('group_name', info.get('group_id', '?'))
@@ -1712,7 +1893,7 @@ class RelationshipManager(Star):
                     )
                 else:
                     r = await self._api(
-                        "set_group_add_request", event=event, flag=flag, approve=False,
+                        info.get("request_api", "set_group_add_request"), event=event, flag=flag, approve=False,
                         sub_type=info.get("sub_type", "invite"),
                     )
             except Exception as e:
@@ -1750,7 +1931,7 @@ class RelationshipManager(Star):
                 )
             else:
                 r = await self._api(
-                    "set_group_add_request", event=event, flag=flag, approve=approve,
+                    info.get("request_api", "set_group_add_request"), event=event, flag=flag, approve=approve,
                     sub_type=info.get("sub_type", "invite"),
                 )
 

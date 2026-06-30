@@ -20,17 +20,18 @@
 
 ### 👥 好友管理
 - 查看好友列表
-- 主动添加好友
+- 主动添加好友（SnowLuma 下依赖实验性 `send_packet`，非标准 OneBot 能力）
 - 删除好友
 
 ### 🏠 群组管理
 - 查看群列表
-- 主动加入群
+- 主动加入群（SnowLuma 下依赖实验性 `send_packet`，非标准 OneBot 能力）
 - 退出群组
 
 ### 📩 请求处理
-- 自动接收并通知管理员好友申请
-- 自动接收并通知管理员群邀请
+- 自动接收并通知管理员好友申请（SnowLuma 标准 `request.friend` 事件）
+- 自动接收并通知管理员群邀请/加群请求（SnowLuma 标准 `request.group` 事件）
+- 同步 SnowLuma 可疑好友申请和被过滤入群请求到待处理列表
 - 支持引用消息快速同意/拒绝/拉黑
 - 待处理请求列表查看
 
@@ -73,8 +74,8 @@ git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relat
 | `/拉黑群` | `/addblg` | 拉黑群组 | 管理员 |
 | `/解封群` | `/rmblg` | 解封群组 | 管理员 |
 | `/待处理` | `/pending` | 查看待处理请求 | 管理员 |
-| `/加好友` | `/addfriend` | 添加好友 | 管理员 |
-| `/加群` | `/addgroup` | 加入群组 | 管理员 |
+| `/加好友` | `/addfriend` | 添加好友；SnowLuma 下走实验性 `send_packet` | 管理员 |
+| `/加群` | `/addgroup` | 加入群组；SnowLuma 下走实验性 `send_packet` | 管理员 |
 | `/删好友` | `/deletefriend` | 删除好友 | 管理员 |
 | `/退群` | `/leavegroup` | 退出群组 | 管理员 |
 | `/同意` | `/accept` | 同意请求；支持引用通知或 `/同意 编号` | 管理员 |
@@ -108,6 +109,7 @@ git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relat
 ```
 /待处理
 ```
+该命令会同时同步 SnowLuma 的可疑好友申请和被过滤入群请求。同步到列表后，可使用 `/同意 编号`、`/拒绝 编号`、`/拉黑请求 编号` 处理。
 
 ## ⚙️ 配置
 
@@ -148,7 +150,7 @@ git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relat
 
 ## 🐛 已知问题
 
-- `/加好友`、`/加群` 依赖 NapCat 的 Packet 能力；若底层未启用或版本不支持，命令会提示手动处理。
+- `/加好友`、`/加群` 不是 OneBot v11 标准 action。SnowLuma 提供 `send_packet`，但这里的主动添加逻辑仍属于原始包实验路径，可能因 QQ/SnowLuma 版本变化失效。
 
 ## 🤝 贡献
 
