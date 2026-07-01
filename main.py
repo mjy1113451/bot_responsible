@@ -34,7 +34,7 @@ except ImportError:
     "astrbot_plugin_relationship_manager",
     "mjy1113451",
     "AstrBot 关系管理插件",
-    "5.2.2",
+    "5.2.3",
     "https://github.com/mjy1113451/bot_responsible",
 )
 class RelationshipManager(Star):
@@ -71,7 +71,7 @@ class RelationshipManager(Star):
         self._patch_astrbot_message_session_id()
         self._cleanup_pending()
         logger.info(
-            "关系管理插件初始化完成 v5.2.2-snowluma-list-return: data_dir=%s, pending_file=%s, pending_count=%s",
+            "关系管理插件初始化完成 v5.2.3-snowluma-api-ok: data_dir=%s, pending_file=%s, pending_count=%s",
             self.data_dir,
             self.pd_file,
             len(self.pending),
@@ -1266,8 +1266,10 @@ class RelationshipManager(Star):
         nickname = uid
         try:
             info_res = await self._api("get_stranger_info", event=event, user_id=int(uid))
-            if info_res and info_res.get("status") == "ok":
-                nickname = info_res.get("data", {}).get("nickname", uid)
+            if self._api_ok(info_res):
+                info_data = self._api_data(info_res)
+                if isinstance(info_data, dict):
+                    nickname = info_data.get("nickname", uid)
         except Exception:
             pass
 
@@ -1328,8 +1330,8 @@ class RelationshipManager(Star):
 
         if self._is_group_blocked(gid):
             res = await self._api("set_group_add_request", event=event, flag=flag, approve=False, sub_type=sub)
-            if not res or res.get("retcode") != 0:
-                logger.warning(f"无法拒绝黑名单群 {gid} 的邀请（可能已被拉入），等待进群后处理")
+            if not self._api_ok(res):
+                logger.warning(f"无法拒绝黑名单群 {gid} 的邀请（可能已被拉入），等待进群后处理: {res}")
             else:
                 await self._notify(
                     f"🚫 自动拒绝黑名单群邀请\n群号: {gid}\n"
@@ -1341,16 +1343,20 @@ class RelationshipManager(Star):
         if uid and uid != "0":
             try:
                 info_res = await self._api("get_stranger_info", event=event, user_id=int(uid))
-                if info_res and info_res.get("status") == "ok":
-                    inviter_nickname = info_res.get("data", {}).get("nickname", uid)
+                if self._api_ok(info_res):
+                    info_data = self._api_data(info_res)
+                    if isinstance(info_data, dict):
+                        inviter_nickname = info_data.get("nickname", uid)
             except Exception:
                 pass
 
         group_name = gid
         try:
             group_res = await self._api("get_group_info", event=event, group_id=int(gid))
-            if group_res and group_res.get("status") == "ok":
-                group_name = group_res.get("data", {}).get("group_name", gid)
+            if self._api_ok(group_res):
+                group_data = self._api_data(group_res)
+                if isinstance(group_data, dict):
+                    group_name = group_data.get("group_name", gid)
         except Exception:
             pass
 
@@ -1822,7 +1828,11 @@ class RelationshipManager(Star):
         ok, fail = [], []
         for u in uids:
             r = await self._api("delete_friend", event=event, user_id=int(u))
-            (ok if r and r.get("status") == "ok" else fail).append(u)
+            if self._api_ok(r):
+                ok.append(u)
+            else:
+                logger.warning(f"删除好友失败: uid={u}, response={r}")
+                fail.append(f"{u}({self._api_failure_text(r)})")
 
         parts = []
         if ok:
@@ -1847,7 +1857,11 @@ class RelationshipManager(Star):
         ok, fail = [], []
         for g in gids:
             r = await self._api("set_group_leave", event=event, group_id=int(g))
-            (ok if r and r.get("status") == "ok" else fail).append(g)
+            if self._api_ok(r):
+                ok.append(g)
+            else:
+                logger.warning(f"退群失败: gid={g}, response={r}")
+                fail.append(f"{g}({self._api_failure_text(r)})")
 
         parts = []
         if ok:
