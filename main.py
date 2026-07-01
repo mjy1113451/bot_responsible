@@ -34,7 +34,7 @@ except ImportError:
     "astrbot_plugin_relationship_manager",
     "mjy1113451",
     "AstrBot 关系管理插件",
-    "5.2.1",
+    "5.2.2",
     "https://github.com/mjy1113451/bot_responsible",
 )
 class RelationshipManager(Star):
@@ -71,7 +71,7 @@ class RelationshipManager(Star):
         self._patch_astrbot_message_session_id()
         self._cleanup_pending()
         logger.info(
-            "关系管理插件初始化完成 v5.2.1-snowluma-direct-uin: data_dir=%s, pending_file=%s, pending_count=%s",
+            "关系管理插件初始化完成 v5.2.2-snowluma-list-return: data_dir=%s, pending_file=%s, pending_count=%s",
             self.data_dir,
             self.pd_file,
             len(self.pending),
@@ -263,7 +263,7 @@ class RelationshipManager(Star):
                 )
             self._save(self.bl_file, self.blacklist)
 
-    async def _api(self, name: str, event: AstrMessageEvent = None, **kw) -> Optional[dict]:
+    async def _api(self, name: str, event: AstrMessageEvent = None, **kw) -> Any:
         """调用 OneBot API"""
         try:
             # 方式1: 通过 event.bot 直接获取客户端（推荐）
@@ -296,15 +296,42 @@ class RelationshipManager(Star):
 
         except Exception as e:
             logger.error(f"API {name} 失败: {e}")
-        return None
+            return {"status": "failed", "retcode": -1, "wording": str(e)}
+        return {"status": "failed", "retcode": -1, "wording": f"API {name} 没有可用客户端"}
 
     @staticmethod
     def _api_ok(res: Any) -> bool:
+        if res is None:
+            return True
+        if isinstance(res, list):
+            return True
         if not isinstance(res, dict):
-            return False
+            return bool(res)
         status = str(res.get("status", "")).lower()
         retcode = res.get("retcode")
-        return status == "ok" or retcode == 0
+        if status in ("failed", "fail", "error"):
+            return False
+        if retcode not in (None, 0, "0"):
+            return False
+        if status == "ok" or retcode in (0, "0"):
+            return True
+        return "status" not in res and "retcode" not in res
+
+    @staticmethod
+    def _api_failure_text(res: Any) -> str:
+        if isinstance(res, dict):
+            wording = res.get("wording") or res.get("message") or res.get("error")
+            retcode = res.get("retcode")
+            status = res.get("status")
+            parts = []
+            if status:
+                parts.append(f"status={status}")
+            if retcode is not None:
+                parts.append(f"retcode={retcode}")
+            if wording:
+                parts.append(f"wording={wording}")
+            return ", ".join(parts) if parts else str(res)
+        return str(res)
 
     async def _notify(self, msg: str):
         """修复7: 委托给 _notify_with_ids，忽略返回值"""
@@ -693,6 +720,8 @@ class RelationshipManager(Star):
 
     @staticmethod
     def _api_data(res: Any) -> Any:
+        if isinstance(res, list):
+            return res
         if not isinstance(res, dict):
             return None
         if "data" in res:
@@ -770,11 +799,15 @@ class RelationshipManager(Star):
     async def _sync_snowluma_doubt_friend_requests(self, event: AstrMessageEvent = None) -> int:
         res = await self._api("get_doubt_friends_add_request", event=event, count=50)
         if not self._api_ok(res):
-            logger.info(f"SnowLuma 可疑好友申请列表不可用或为空: response={res}")
+            logger.info(f"SnowLuma 可疑好友申请列表不可用: response={res}")
             return 0
 
         added = 0
-        for item in self._api_list(res):
+        items = self._api_list(res)
+        if not items:
+            logger.info("SnowLuma 可疑好友申请列表为空")
+            return 0
+        for item in items:
             flag = str(item.get("uid", "")).strip()
             if not flag:
                 continue
@@ -813,18 +846,31 @@ class RelationshipManager(Star):
     async def _sync_snowluma_filtered_group_requests(self, event: AstrMessageEvent = None) -> int:
         res = await self._api("get_group_ignored_notifies", event=event)
         if not self._api_ok(res):
-            logger.info(f"SnowLuma 被过滤入群请求列表不可用或为空: response={res}")
+            logger.info(f"SnowLuma 被过滤入群请求列表不可用: response={res}")
             return 0
 
         added = 0
-        for item in self._api_list(res):
+        items = self._api_list(res)
+        if not items:
+            logger.info("SnowLuma 被过滤入群请求列表为空")
+            return 0
+        for item in items:
             if item.get("checked") is True:
                 continue
             flag = str(item.get("flag", "")).strip()
             gid = str(item.get("group_id", "") or "").strip()
             uid = str(item.get("requester_uin", "") or item.get("invitor_uin", "") or "0").strip()
             if not flag or not gid:
-                continue
+                fallback_parts = [
+                    str(item.get("request_id", "") or item.get("sequence", "")).strip(),
+                    gid,
+                    uid,
+                ]
+                logger.warning(f"SnowLuma 被过滤入群请求缺少处理 flag，尝试用返回字段构造: item={item}")
+                if fallback_parts[0] and gid:
+                    flag = ":".join(part for part in fallback_parts if part)
+                if not flag or not gid:
+                    continue
             group_name = str(item.get("group_name", "") or gid).strip()
             inviter_nickname = str(item.get("invitor_nick", "") or uid).strip()
             comment = str(item.get("message", "") or "").strip()
@@ -1885,15 +1931,17 @@ class RelationshipManager(Star):
         if action == "block":
             try:
                 if info["type"] == "friend":
+                    api_name = info.get("request_api", "set_friend_add_request")
                     r = await self._api(
-                        info.get("request_api", "set_friend_add_request"),
+                        api_name,
                         event=event,
                         flag=flag,
                         approve=False,
                     )
                 else:
+                    api_name = info.get("request_api", "set_group_add_request")
                     r = await self._api(
-                        info.get("request_api", "set_group_add_request"), event=event, flag=flag, approve=False,
+                        api_name, event=event, flag=flag, approve=False,
                         sub_type=info.get("sub_type", "invite"),
                     )
             except Exception as e:
@@ -1902,8 +1950,9 @@ class RelationshipManager(Star):
                 return
 
             if not self._api_ok(r):
-                logger.warning(f"拒绝并拉黑失败: flag={flag}, response={r}")
-                yield event.plain_result("❌ 拒绝请求失败，未写入黑名单；请查看平台返回")
+                detail = self._api_failure_text(r)
+                logger.warning(f"拒绝并拉黑失败: api={api_name}, flag={flag}, response={r}")
+                yield event.plain_result(f"❌ 拒绝请求失败，未写入黑名单\n{detail}")
                 return
 
             # 修复3: _add_to_blacklist 现在是 async，加 await
@@ -1923,15 +1972,17 @@ class RelationshipManager(Star):
         approve = (action == "accept")
         try:
             if info["type"] == "friend":
+                api_name = info.get("request_api", "set_friend_add_request")
                 r = await self._api(
-                    info.get("request_api", "set_friend_add_request"),
+                    api_name,
                     event=event,
                     flag=flag,
                     approve=approve,
                 )
             else:
+                api_name = info.get("request_api", "set_group_add_request")
                 r = await self._api(
-                    info.get("request_api", "set_group_add_request"), event=event, flag=flag, approve=approve,
+                    api_name, event=event, flag=flag, approve=approve,
                     sub_type=info.get("sub_type", "invite"),
                 )
 
@@ -1943,7 +1994,16 @@ class RelationshipManager(Star):
                 act_text = "同意" if approve else "拒绝"
                 yield event.plain_result(f"✅ 已{act_text}{kind}\n{target}")
             else:
-                yield event.plain_result("❌ 操作失败，平台返回异常")
+                detail = self._api_failure_text(r)
+                logger.warning(
+                    "处理请求失败: api=%s, flag=%s, approve=%s, info=%s, response=%s",
+                    api_name,
+                    flag,
+                    approve,
+                    info,
+                    r,
+                )
+                yield event.plain_result(f"❌ 操作失败，平台返回异常\n{detail}")
         except Exception as e:
             logger.error(f"处理 {flag} 异常: {e}")
             yield event.plain_result("❌ 操作异常，请查看日志")
