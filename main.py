@@ -73,7 +73,7 @@ class RelationshipManager(Star):
     # ───────── 持久化 ─────────
 
 @staticmethod
-    def _patch_astrbot_message_session_id():
+def _patch_astrbot_message_session_id():
         """ SnowLuma/OneBot request events may be wrapped as AstrBotMessage without a session_id. AstrBot may access it before plugin code runs, so patch the message class once to give request/notice wrappers a safe default. """
         try:
             from astrbot.core.platform.astrbot_message import AstrBotMessage
