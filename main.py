@@ -1,4 +1,4 @@
-import json
+﻿import json
 import re
 import asyncio
 import uuid
@@ -30,13 +30,7 @@ except ImportError:
         logger.warning("expansion 模块未找到，加好友/加群功能将不可用")
 
 
-@register(
-    "astrbot_plugin_relationship_manager",
-    "mjy1113451",
-    "AstrBot 关系管理插件",
-    "5.2.3",
-    "https://github.com/mjy1113451/bot_responsible",
-)
+@register( "astrbot_plugin_relationship_manager", "mjy1113451", "AstrBot 关系管理插件", "5.2.3", "https://github.com/mjy1113451/bot_responsible", )
 class RelationshipManager(Star):
 
     # OneBot v11 CQ 码
@@ -66,7 +60,6 @@ class RelationshipManager(Star):
         self.pending: Dict[str, dict] = self._load(self.pd_file, {})
         self._migrate_blacklist()
 
-        self.notify_group: Optional[str] = config.get("notify_group", None)
         self._lock = asyncio.Lock()
         self._patch_astrbot_message_session_id()
         self._cleanup_pending()
@@ -79,13 +72,9 @@ class RelationshipManager(Star):
 
     # ───────── 持久化 ─────────
 
-    @staticmethod
+@staticmethod
     def _patch_astrbot_message_session_id():
-        """
-        SnowLuma/OneBot request events may be wrapped as AstrBotMessage without
-        a session_id. AstrBot may access it before plugin code runs, so patch
-        the message class once to give request/notice wrappers a safe default.
-        """
+        """ SnowLuma/OneBot request events may be wrapped as AstrBotMessage without a session_id. AstrBot may access it before plugin code runs, so patch the message class once to give request/notice wrappers a safe default. """
         try:
             from astrbot.core.platform.astrbot_message import AstrBotMessage
         except Exception as e:
@@ -117,7 +106,7 @@ class RelationshipManager(Star):
         AstrBotMessage._relationship_manager_session_patch = True
         logger.info("已启用 SnowLuma/OneBot request 事件 session_id 兼容补丁")
 
-    @staticmethod
+@staticmethod
     def _load(path: Path, default):
         if not path.exists():
             return default
@@ -136,10 +125,7 @@ class RelationshipManager(Star):
             logger.error(f"保存 {path.name} 失败: {e}")
 
     def _migrate_blacklist(self):
-        """
-        修复1: 重建字典代替就地修改，避免迭代时修改字典导致的跳跃问题
-        修复2: 同时迁移顶层 group_blacklist（如果它是 dict 而非嵌套在 group_blacklist key 下）
-        """
+        """ 修复1: 重建字典代替就地修改，避免迭代时修改字典导致的跳跃问题 修复2: 同时迁移顶层 group_blacklist（如果它是 dict 而非嵌套在 group_blacklist key 下） """
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         changed = False
 
@@ -223,15 +209,15 @@ class RelationshipManager(Star):
         except Exception:
             return False
 
-    @staticmethod
+@staticmethod
     def _ids(text: str) -> List[str]:
         return re.findall(r"\b(\d{5,12})\b", text)
 
-    @classmethod
+@classmethod
     def _valid_uid(cls, uid: str) -> bool:
         return bool(re.fullmatch(r"\d{5,12}", uid))
 
-    @classmethod
+@classmethod
     def _valid_gid(cls, gid: str) -> bool:
         return bool(re.fullmatch(r"\d{5,12}", gid))
 
@@ -245,9 +231,7 @@ class RelationshipManager(Star):
         return []
 
     async def _add_to_blacklist(self, uid: str):
-        """
-        修复3: 添加锁保护，确保线程/协程安全
-        """
+        """ 修复3: 添加锁保护，确保线程/协程安全 """
         if not uid:
             return
         async with self._lock:
@@ -299,7 +283,7 @@ class RelationshipManager(Star):
             return {"status": "failed", "retcode": -1, "wording": str(e)}
         return {"status": "failed", "retcode": -1, "wording": f"API {name} 没有可用客户端"}
 
-    @staticmethod
+@staticmethod
     def _api_ok(res: Any) -> bool:
         if res is None:
             return True
@@ -317,7 +301,7 @@ class RelationshipManager(Star):
             return True
         return "status" not in res and "retcode" not in res
 
-    @staticmethod
+@staticmethod
     def _api_failure_text(res: Any) -> str:
         if isinstance(res, dict):
             wording = res.get("wording") or res.get("message") or res.get("error")
@@ -379,7 +363,7 @@ class RelationshipManager(Star):
         return ids
 
     async def _notify_with_ids(self, msg: str) -> List[str]:
-        """发送通知消息"""
+        """发送通知消息——始终私信管理员"""
         ids = []
         try:
             # 尝试获取客户端
@@ -394,16 +378,11 @@ class RelationshipManager(Star):
                 pass
 
             if client:
-                # 使用客户端直接发送
-                if self.notify_group:
-                    res = await client.send_group_msg(group_id=int(self.notify_group), message=msg)
+                # 使用客户端直接发送私信给所有管理员
+                for aid in self._get_admins():
+                    res = await client.send_private_msg(user_id=int(aid), message=msg)
                     if res and isinstance(res, dict):
                         ids.extend(self._collect_message_ids(res))
-                else:
-                    for aid in self._get_admins():
-                        res = await client.send_private_msg(user_id=int(aid), message=msg)
-                        if res and isinstance(res, dict):
-                            ids.extend(self._collect_message_ids(res))
             else:
                 # 回退到 send_message
                 from astrbot.api.message_components import Plain
@@ -421,18 +400,14 @@ class RelationshipManager(Star):
                 except Exception:
                     pass
 
-                if self.notify_group:
-                    session = f"{platform_name}:GroupMessage:{self.notify_group}"
+                for aid in self._get_admins():
+                    session = f"{platform_name}:FriendMessage:{aid}"
                     await self.context.send_message(session, message_chain)
-                else:
-                    for aid in self._get_admins():
-                        session = f"{platform_name}:FriendMessage:{aid}"
-                        await self.context.send_message(session, message_chain)
         except Exception as e:
             logger.error(f"发送通知失败: {e}")
         return list(dict.fromkeys(ids))
 
-    @staticmethod
+@staticmethod
     def _normalize_msg_id(value: Any) -> Optional[str]:
         if value is None:
             return None
@@ -441,7 +416,7 @@ class RelationshipManager(Star):
         text = str(value).strip()
         return text or None
 
-    @staticmethod
+@staticmethod
     def _new_request_id() -> str:
         return uuid.uuid4().hex[:10]
 
@@ -537,7 +512,7 @@ class RelationshipManager(Star):
 
         return walk(node)
 
-    @staticmethod
+@staticmethod
     def _looks_like_friend_request(payload: dict) -> bool:
         request_type = str(payload.get("request_type", "")).lower()
         post_type = str(payload.get("post_type", "")).lower()
@@ -550,7 +525,7 @@ class RelationshipManager(Star):
             or (has_flag and has_user and not has_group)
         )
 
-    @staticmethod
+@staticmethod
     def _looks_like_group_request(payload: dict) -> bool:
         request_type = str(payload.get("request_type", "")).lower()
         post_type = str(payload.get("post_type", "")).lower()
@@ -563,7 +538,7 @@ class RelationshipManager(Star):
             or (has_flag and has_group and has_user)
         )
 
-    @staticmethod
+@staticmethod
     def _looks_like_notice(payload: dict) -> bool:
         notice_type = str(payload.get("notice_type", "")).lower()
         post_type = str(payload.get("post_type", "")).lower()
@@ -588,9 +563,7 @@ class RelationshipManager(Star):
 
         return None
 
-    def _extract_reply_id_from_node(
-        self, node: Any, seen: Set[int], allow_direct_id: bool = False
-    ) -> Optional[str]:
+    def _extract_reply_id_from_node( self, node: Any, seen: Set[int], allow_direct_id: bool = False ) -> Optional[str]:
         if node is None:
             return None
 
@@ -676,9 +649,7 @@ class RelationshipManager(Star):
         return self._extract_reply_id_from_text(str(node))
 
     def _get_reply_id(self, event: AstrMessageEvent) -> Optional[str]:
-        """
-        兼容 AstrBot 组件对象、OneBot array 上报、CQ 码字符串和原始事件 dict 中的引用消息结构。
-        """
+        """ 兼容 AstrBot 组件对象、OneBot array 上报、CQ 码字符串和原始事件 dict 中的引用消息结构。 """
         for candidate in (
             getattr(event, "message_obj", None),
             getattr(getattr(event, "message_obj", None), "message", None),
@@ -718,7 +689,7 @@ class RelationshipManager(Star):
                 return flag
         return None
 
-    @staticmethod
+@staticmethod
     def _api_data(res: Any) -> Any:
         if isinstance(res, list):
             return res
@@ -786,11 +757,7 @@ class RelationshipManager(Star):
         return None
 
     async def _sync_snowluma_pending_requests(self, event: AstrMessageEvent = None) -> int:
-        """
-        SnowLuma normal requests arrive as OneBot request events. Some QQ-side
-        filtered requests only appear in SnowLuma's extended list actions; sync
-        those into the same pending table so /同意 /拒绝 can process them by id.
-        """
+        """ SnowLuma normal requests arrive as OneBot request events. Some QQ-side filtered requests only appear in SnowLuma's extended list actions; sync those into the same pending table so /同意 /拒绝 can process them by id. """
         added = 0
         added += await self._sync_snowluma_doubt_friend_requests(event)
         added += await self._sync_snowluma_filtered_group_requests(event)
@@ -1036,9 +1003,7 @@ class RelationshipManager(Star):
         logger.info(f"已拉取引用消息用于匹配: reply_id={reply_id}, text_fragments={len(texts)}")
         return texts
 
-    async def _recover_friend_request_from_notice(
-        self, event: AstrMessageEvent, reply_id: str = None
-    ) -> Optional[dict]:
+    async def _recover_friend_request_from_notice( self, event: AstrMessageEvent, reply_id: str = None ) -> Optional[dict]:
         texts: List[str] = []
         for candidate in (
             event,
@@ -1219,7 +1184,7 @@ class RelationshipManager(Star):
 
     # ───────── 请求事件自动监听 ─────────
 
-    @filter.event_message_type(EventMessageType.ALL)
+@filter.event_message_type(EventMessageType.ALL)
     async def handle_event(self, event: AstrMessageEvent) -> Optional[AstrMessageEvent]:
         try:
             raw = self._extract_event_payload(event, self._looks_like_friend_request)
@@ -1302,10 +1267,7 @@ class RelationshipManager(Star):
             logger.warning(f"好友申请通知未获取到可匹配的消息ID: flag={flag}, uid={uid}")
 
     async def _on_group_invite(self, raw: dict, event: AstrMessageEvent = None):
-        """
-        修复4: uid="0"（机器人主动申请加群）场景单独处理，
-        走 group_blacklist 校验而非 user blacklist
-        """
+        """ 修复4: uid="0"（机器人主动申请加群）场景单独处理， 走 group_blacklist 校验而非 user blacklist """
         uid = str(raw.get("user_id", ""))
         gid = str(raw.get("group_id", ""))
         flag = str(raw.get("flag", ""))
@@ -1394,11 +1356,9 @@ class RelationshipManager(Star):
 
     # ───────── 通知事件监听（被踢 / 进群）─────────
 
-    @filter.event_message_type(EventMessageType.ALL)
+@filter.event_message_type(EventMessageType.ALL)
     async def handle_notice(self, event: AstrMessageEvent):
-        """
-        修复9: asyncio.sleep(2) 包装在 try/except 中，防止 notice_type 不匹配时异常泄漏
-        """
+        """ 修复9: asyncio.sleep(2) 包装在 try/except 中，防止 notice_type 不匹配时异常泄漏 """
         try:
             raw = self._extract_event_payload(event, self._looks_like_notice)
             if isinstance(raw, dict):
@@ -1441,13 +1401,39 @@ class RelationshipManager(Star):
                                 f"🚫 Bot被拉入黑名单群 {group_id}\n"
                                 f"已发送提示并自动退出该群"
                             )
+                        else:
+                            # Bot 被拉进非黑名单群，私信通知 bot 主
+                            group_name = group_id
+                            try:
+                                group_res = await self._api("get_group_info", event=event, group_id=int(group_id))
+                                if self._api_ok(group_res):
+                                    group_data = self._api_data(group_res)
+                                    if isinstance(group_data, dict):
+                                        group_name = group_data.get("group_name", group_id)
+                            except Exception:
+                                pass
+
+                            inviter_name = operator_id if operator_id else "未知"
+                            if operator_id:
+                                try:
+                                    info_res = await self._api("get_stranger_info", event=event, user_id=int(operator_id))
+                                    if self._api_ok(info_res):
+                                        info_data = self._api_data(info_res)
+                                        if isinstance(info_data, dict):
+                                            inviter_name = info_data.get("nickname", operator_id)
+                                except Exception:
+                                    pass
+
+                            await self._notify(
+                                f"呜呜呜！我被{inviter_name}拉进了{group_name}{group_id}"
+                            )
 
         except Exception as e:
             logger.error(f"处理通知事件异常: {e}")
 
     # ───────── 查看列表 ─────────
 
-    @filter.command("好友", alias=["fl"])
+@filter.command("好友", alias=["fl"])
     async def cmd_friends(self, event: AstrMessageEvent):
         if self._sender_blocked(event):
             return
@@ -1481,7 +1467,7 @@ class RelationshipManager(Star):
 
         yield event.plain_result("\n".join(lines))
 
-    @filter.command("群", alias=["gl"])
+@filter.command("群", alias=["gl"])
     async def cmd_groups(self, event: AstrMessageEvent):
         if self._sender_blocked(event):
             return
@@ -1517,7 +1503,7 @@ class RelationshipManager(Star):
 
     # ───────── 黑名单 ─────────
 
-    @filter.command("拉黑", alias=["addbl", "屏蔽"])
+@filter.command("拉黑", alias=["addbl", "屏蔽"])
     async def cmd_bl_add(self, event: AstrMessageEvent, args: str = ""):
         if self._sender_blocked(event):
             return
@@ -1531,7 +1517,7 @@ class RelationshipManager(Star):
                 async for result in self._process_reply(event, action="block"):
                     yield result
                 return
-            yield event.plain_result("⚠️ /拉黑 12345 [67890] ...  或引用通知消息回复 /拉黑")
+            yield event.plain_result("⚠️ /拉黑 12345 [67890] ... 或引用通知消息回复 /拉黑")
             return
 
         valid, invalid = [], []
@@ -1566,7 +1552,7 @@ class RelationshipManager(Star):
             parts.append(f"⚠️ 已存在: {', '.join(dup)}")
         yield event.plain_result("\n".join(parts))
 
-    @filter.command("解封", alias=["rmbl", "取消屏蔽"])
+@filter.command("解封", alias=["rmbl", "取消屏蔽"])
     async def cmd_bl_rm(self, event: AstrMessageEvent, args: str = ""):
         if self._sender_blocked(event):
             return
@@ -1596,7 +1582,7 @@ class RelationshipManager(Star):
             parts.append(f"⚠️ 不存在: {', '.join(miss)}")
         yield event.plain_result("\n".join(parts))
 
-    @filter.command("黑名单", alias=["lsbl"])
+@filter.command("黑名单", alias=["lsbl"])
     async def cmd_bl_ls(self, event: AstrMessageEvent):
         if self._sender_blocked(event):
             return
@@ -1626,7 +1612,7 @@ class RelationshipManager(Star):
 
     # ───────── 待处理 ─────────
 
-    @filter.command("待处理", alias=["pending"])
+@filter.command("待处理", alias=["pending"])
     async def cmd_pending(self, event: AstrMessageEvent):
         if self._sender_blocked(event):
             return
@@ -1669,7 +1655,7 @@ class RelationshipManager(Star):
 
     # ───────── 加好友 / 加群 ─────────
 
-    @filter.command("加好友", alias=["addfriend"])
+@filter.command("加好友", alias=["addfriend"])
     async def cmd_add_friend(self, event: AstrMessageEvent, args: str = ""):
         if self._sender_blocked(event):
             return
@@ -1740,7 +1726,7 @@ class RelationshipManager(Star):
             else:
                 yield event.plain_result(f"❌ 加好友失败: {str(e)}")
 
-    @filter.command("加群", alias=["addgroup"])
+@filter.command("加群", alias=["addgroup"])
     async def cmd_add_group(self, event: AstrMessageEvent, args: str = ""):
         if self._sender_blocked(event):
             return
@@ -1812,7 +1798,7 @@ class RelationshipManager(Star):
 
     # ───────── 删好友 / 退群 ─────────
 
-    @filter.command("删好友", alias=["deletefriend"])
+@filter.command("删好友", alias=["deletefriend"])
     async def cmd_del_friend(self, event: AstrMessageEvent, args: str = ""):
         if self._sender_blocked(event):
             return
@@ -1841,7 +1827,7 @@ class RelationshipManager(Star):
             parts.append(f"❌ 失败: {', '.join(fail)}")
         yield event.plain_result("\n".join(parts) if parts else "❌ 无结果")
 
-    @filter.command("退群", alias=["leavegroup"])
+@filter.command("退群", alias=["leavegroup"])
     async def cmd_leave_group(self, event: AstrMessageEvent, args: str = ""):
         if self._sender_blocked(event):
             return
@@ -2022,24 +2008,24 @@ class RelationshipManager(Star):
             logger.error(f"处理 {flag} 异常: {e}")
             yield event.plain_result("❌ 操作异常，请查看日志")
 
-    @filter.command("同意", alias=["accept"], priority=1, block=True)
+@filter.command("同意", alias=["accept"], priority=1, block=True)
     async def cmd_accept(self, event: AstrMessageEvent, args: str = ""):
         async for result in self._process_reply(event, action="accept", args=args):
             yield result
 
-    @filter.command("拒绝", alias=["reject"], priority=1, block=True)
+@filter.command("拒绝", alias=["reject"], priority=1, block=True)
     async def cmd_reject(self, event: AstrMessageEvent, args: str = ""):
         async for result in self._process_reply(event, action="reject", args=args):
             yield result
 
-    @filter.command("拉黑请求", alias=["blockreply"], priority=1, block=True)
+@filter.command("拉黑请求", alias=["blockreply"], priority=1, block=True)
     async def cmd_block_reply(self, event: AstrMessageEvent, args: str = ""):
         async for result in self._process_reply(event, action="block", args=args):
             yield result
 
     # ───────── 群黑名单管理命令 ─────────
 
-    @filter.command("拉黑群", alias=["addblg"])
+@filter.command("拉黑群", alias=["addblg"])
     async def cmd_bl_add_group(self, event: AstrMessageEvent, args: str = ""):
         if self._sender_blocked(event):
             return
@@ -2087,7 +2073,7 @@ class RelationshipManager(Star):
             parts.append(f"⚠️ 已存在: {', '.join(dup)}")
         yield event.plain_result("\n".join(parts))
 
-    @filter.command("解封群", alias=["rmblg"])
+@filter.command("解封群", alias=["rmblg"])
     async def cmd_bl_rm_group(self, event: AstrMessageEvent, args: str = ""):
         if self._sender_blocked(event):
             return
@@ -2121,48 +2107,6 @@ class RelationshipManager(Star):
         if miss:
             parts.append(f"⚠️ 不存在: {', '.join(miss)}")
         yield event.plain_result("\n".join(parts))
-
-    # ───────── 通知群设置 ─────────
-
-    @filter.command("通知群", alias=["setnotify", "setgroup"])
-    async def cmd_set_notify_group(self, event: AstrMessageEvent, args: str = ""):
-        if self._sender_blocked(event):
-            return
-        if not self._is_admin(event):
-            yield event.plain_result("❌ 仅管理员可用")
-            return
-
-        arg = args.strip()
-        if not arg or arg == "查看":
-            if self.notify_group:
-                yield event.plain_result(f"📢 当前通知群: {self.notify_group}")
-            else:
-                yield event.plain_result("📢 当前未设置通知群（通知发送给管理员私聊）")
-            return
-
-        if arg in ("取消", "清空", "关闭", "none", "null", "off"):
-            self.notify_group = None
-            config = self.context.get_config()
-            config["notify_group"] = None
-            self.context.set_config(config)
-            yield event.plain_result("✅ 已取消通知群，通知将发送给管理员私聊")
-            return
-
-        gids = self._ids(arg)
-        if not gids:
-            yield event.plain_result("⚠️ /通知群 123456  或  /通知群 取消")
-            return
-
-        gid = gids[0]
-        if not self._valid_gid(gid):
-            yield event.plain_result(f"⚠️ 群号格式无效（需5-12位数字）: {gid}")
-            return
-
-        self.notify_group = gid
-        config = self.context.get_config()
-        config["notify_group"] = gid
-        self.context.set_config(config)
-        yield event.plain_result(f"✅ 通知群已设置为: {gid}\n后续好友申请和群邀请通知将发送到该群")
 
     # ───────── 生命周期 ─────────
 
