@@ -1036,6 +1036,85 @@ class RelationshipManager(Star):
         logger.info(f"已拉取引用消息用于匹配: reply_id={reply_id}, text_fragments={len(texts)}")
         return texts
 
+    def _extract_group_invite_from_notice_text(self, text: str) -> Optional[dict]:
+        if not text or "群邀请" not in text:
+            return None
+
+        # 从文本提取关键字段
+        gid = ""
+        uid = ""
+        nickname = ""
+        group_name = ""
+        request_id = ""
+
+        # 编号（内部ID，非server flag）
+        m = re.search(r"编号[:：]\s*([^\n\r]+)", text)
+        if m:
+            request_id = m.group(1).strip()
+
+        # 群号
+        m = re.search(r"群号[:：]\s*(\d{5,12})", text)
+        if m:
+            gid = m.group(1).strip()
+
+        # 邀请人QQ
+        m = re.search(r"(?:邀请人QQ|QQ号)[:：]\s*(\d{5,12})", text)
+        if m:
+            uid = m.group(1).strip()
+
+        # 邀请人昵称
+        m = re.search(r"邀请人昵称[:：]\s*([^\n\r]+)", text)
+        if m:
+            nickname = m.group(1).strip()
+
+        # 群名称
+        m = re.search(r"群名称[:：]\s*([^\n\r]+)", text)
+        if m:
+            group_name = m.group(1).strip()
+
+        if not gid and not uid:
+            return None
+
+        return dict(
+            type="group",
+            group_id=gid or "0",
+            group_name=group_name or gid or "未知群",
+            user_id=uid or "0",
+            inviter_nickname=nickname or uid or "未知",
+            sub_type="invite",
+            comment="",
+            time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            notify_ids=[],
+            request_id=request_id or uid or gid,
+            request_flag=gid or "",  # server flag丢失，用group_id尝试
+            request_type="group",
+            request_api="set_group_add_request",
+            recovered_from_notice=True,
+        )
+
+    async def _recover_group_request_from_notice(
+        self, event: AstrMessageEvent, reply_id: str = None
+    ) -> Optional[dict]:
+        texts: List[str] = []
+        for candidate in (
+            event,
+            getattr(event, "message_obj", None),
+            getattr(getattr(event, "message_obj", None), "message", None),
+            getattr(getattr(event, "message_obj", None), "raw_message", None),
+        ):
+            for text in self._collect_text_fragments(candidate):
+                if text and text not in texts:
+                    texts.append(text)
+        if reply_id:
+            for text in await self._collect_replied_message_texts(event, reply_id):
+                if text and text not in texts:
+                    texts.append(text)
+        for text in texts:
+            info = self._extract_group_invite_from_notice_text(text)
+            if info:
+                return info
+        return None
+
     async def _recover_friend_request_from_notice(
         self, event: AstrMessageEvent, reply_id: str = None
     ) -> Optional[dict]:
@@ -1908,10 +1987,20 @@ class RelationshipManager(Star):
             if recovered_info:
                 flag = recovered_info["request_flag"]
                 logger.info(
-                    "从引用通知恢复 SnowLuma 好友申请: flag=%s, uid=%s, nickname=%s",
+                    "从引用通知恢复好友申请: flag=%s, uid=%s, nickname=%s",
                     flag,
                     recovered_info.get("user_id"),
                     recovered_info.get("nickname"),
+                )
+        if not flag:
+            recovered_info = await self._recover_group_request_from_notice(event, reply_id)
+            if recovered_info:
+                flag = recovered_info["request_flag"]
+                logger.info(
+                    "从引用通知恢复群邀请: flag=%s, gid=%s, uid=%s",
+                    flag,
+                    recovered_info.get("group_id"),
+                    recovered_info.get("user_id"),
                 )
         if not flag:
             if args:
@@ -1921,7 +2010,10 @@ class RelationshipManager(Star):
                 yield event.plain_result("⚠️ 请引用通知消息回复 /同意 或 /拒绝 或 /拉黑，或使用 /同意 编号")
                 return
             if not self.pending:
-                yield event.plain_result("❌ 当前没有待处理请求记录；SnowLuma 标准 request 事件和扩展过滤列表均未发现未处理申请")
+                yield event.plain_result(
+                    "⚠️ 待处理列表为空，无法自动处理该请求。\n"
+                    "该请求可能已过期或被处理过，请直接在QQ中操作。"
+                )
                 return
             yield event.plain_result("❌ 该引用消息未匹配到待处理请求")
             return
@@ -1980,7 +2072,20 @@ class RelationshipManager(Star):
                     return
                 detail = self._api_failure_text(r)
                 logger.warning(f"拒绝并拉黑失败: api={api_name}, flag={flag}, response={r}")
-                yield event.plain_result(f"❌ 拒绝请求失败，未写入黑名单\n{detail}")
+                if info.get("recovered_from_notice"):
+                    # 从通知恢复的请求，API可能失败但仍拉黑该用户
+                    if uid and uid != "0":
+                        await self._add_to_blacklist(uid)
+                    async with self._lock:
+                        self.pending.pop(flag, None)
+                        self._save(self.pd_file, self.pending)
+                    yield event.plain_result(
+                        f"⚠️ 自动处理失败，已将用户加入黑名单\n"
+                        f"{detail}\n{target}\n"
+                        f"该请求可能已过期，请直接在QQ中操作"
+                    )
+                else:
+                    yield event.plain_result(f"❌ 拒绝请求失败，未写入黑名单\n{detail}")
                 return
 
             # 修复3: _add_to_blacklist 现在是 async，加 await
@@ -2041,7 +2146,14 @@ class RelationshipManager(Star):
                         info,
                         r,
                     )
-                    yield event.plain_result(f"❌ 操作失败，平台返回异常\n{detail}")
+                    if info.get("recovered_from_notice"):
+                        yield event.plain_result(
+                            f"❌ 从通知消息恢复的请求处理失败\n"
+                            f"{detail}\n"
+                            f"该请求可能已过期，请直接在QQ中操作"
+                        )
+                    else:
+                        yield event.plain_result(f"❌ 操作失败，平台返回异常\n{detail}")
         except Exception as e:
             logger.error(f"处理 {flag} 异常: {e}")
             yield event.plain_result("❌ 操作异常，请查看日志")
