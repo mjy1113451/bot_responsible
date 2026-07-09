@@ -1033,12 +1033,45 @@ class RelationshipManager(Star):
             logger.warning(f"拉取引用消息无结果: reply_id={reply_id}")
             return []
         texts = self._collect_text_fragments(res)
+
+        # 额外提取: 如果 get_msg 的 message 字段是 JSON 字符串，解析并提取文本值
+        data = res.get("data") if isinstance(res, dict) else None
+        if isinstance(data, dict):
+            for key in ("message", "raw_message"):
+                raw = data.get(key)
+                if isinstance(raw, str) and raw.strip()[:1] in ("{", "["):
+                    try:
+                        parsed = json.loads(raw)
+                        for val in self._walk_json_values(parsed):
+                            if isinstance(val, str) and val.strip() and val.strip() not in texts:
+                                texts.append(val.strip())
+                    except Exception:
+                        pass
         logger.info(f"已拉取引用消息用于匹配: reply_id={reply_id}, text_fragments={len(texts)}")
         return texts
+
+    def _walk_json_values(self, node: Any):
+        """遍历JSON对象，yield所有字符串值"""
+        if node is None:
+            return
+        if isinstance(node, str):
+            yield node
+            return
+        if isinstance(node, (int, float, bool)):
+            return
+        if isinstance(node, dict):
+            for v in node.values():
+                yield from self._walk_json_values(v)
+            return
+        if isinstance(node, (list, tuple)):
+            for item in node:
+                yield from self._walk_json_values(item)
 
     def _extract_group_invite_from_notice_text(self, text: str) -> Optional[dict]:
         if not text or "群邀请" not in text:
             return None
+
+        logger.debug("解析群邀请通知文本 (前200字): %s", text[:200])
 
         # 从文本提取关键字段
         gid = ""
@@ -1052,15 +1085,35 @@ class RelationshipManager(Star):
         if m:
             request_id = m.group(1).strip()
 
-        # 群号
-        m = re.search(r"群号[:：]\s*(\d{5,12})", text)
-        if m:
-            gid = m.group(1).strip()
+        # 群号（多种格式）
+        for pattern in [r"群号[:：]\s*(\d{5,12})", r"群号[:：]\s*(\d+)"]:
+            m = re.search(pattern, text)
+            if m:
+                gid = m.group(1).strip()
+                break
 
-        # 邀请人QQ
-        m = re.search(r"(?:邀请人QQ|QQ号)[:：]\s*(\d{5,12})", text)
-        if m:
-            uid = m.group(1).strip()
+        # 如果没有群号字段，从文本中提取所有数字，取第一个合理长度的
+        if not gid:
+            all_nums = re.findall(r"\b(\d{5,15})\b", text)
+            for num in all_nums:
+                if num != uid and num != request_id:
+                    gid = num
+                    break
+
+        # 邀请人QQ（多种格式）
+        for pattern in [r"(?:邀请人QQ|QQ号)[:：]\s*(\d{5,12})", r"(?:邀请人QQ|QQ号)[:：]\s*(\d+)"]:
+            m = re.search(pattern, text)
+            if m:
+                uid = m.group(1).strip()
+                break
+
+        # 如果没有QQ字段，从文本中提取
+        if not uid:
+            all_nums = re.findall(r"\b(\d{5,15})\b", text)
+            for num in all_nums:
+                if num != gid and num != request_id:
+                    uid = num
+                    break
 
         # 邀请人昵称
         m = re.search(r"邀请人昵称[:：]\s*([^\n\r]+)", text)
@@ -1072,8 +1125,16 @@ class RelationshipManager(Star):
         if m:
             group_name = m.group(1).strip()
 
+        logger.info(
+            "通知文本解析结果: gid=%s, uid=%s, nickname=%s, group_name=%s, request_id=%s",
+            gid, uid, nickname, group_name, request_id,
+        )
+
         if not gid and not uid:
             return None
+
+        # 确定用于API调用的flag：优先用gid，否则用uid
+        api_flag = gid or uid or ""
 
         return dict(
             type="group",
@@ -1086,7 +1147,7 @@ class RelationshipManager(Star):
             time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             notify_ids=[],
             request_id=request_id or uid or gid,
-            request_flag=gid or "",  # server flag丢失，用group_id尝试
+            request_flag=api_flag,
             request_type="group",
             request_api="set_group_add_request",
             recovered_from_notice=True,
@@ -1095,6 +1156,32 @@ class RelationshipManager(Star):
     async def _recover_group_request_from_notice(
         self, event: AstrMessageEvent, reply_id: str = None
     ) -> Optional[dict]:
+        # 优先从 get_msg 获取原始通知文本（最干净的来源）
+        if reply_id:
+            try:
+                try:
+                    res = await self._api("get_msg", event=event, message_id=int(reply_id))
+                except ValueError:
+                    res = await self._api("get_msg", event=event, message_id=reply_id)
+                if res and isinstance(res, dict):
+                    data = res.get("data")
+                    if isinstance(data, dict):
+                        msg_text = data.get("message", "")
+                        if isinstance(msg_text, str) and "群邀请" in msg_text:
+                            info = self._extract_group_invite_from_notice_text(msg_text)
+                            if info:
+                                logger.info("从 get_msg.message 直接恢复群邀请")
+                                return info
+                        raw_msg = data.get("raw_message", "")
+                        if isinstance(raw_msg, str) and "群邀请" in raw_msg:
+                            info = self._extract_group_invite_from_notice_text(raw_msg)
+                            if info:
+                                logger.info("从 get_msg.raw_message 直接恢复群邀请")
+                                return info
+            except Exception as e:
+                logger.debug(f"从 get_msg 恢复群邀请失败: {e}")
+
+        # 回退: 从事件文本片段中查找
         texts: List[str] = []
         for candidate in (
             event,
