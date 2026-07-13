@@ -1607,6 +1607,40 @@ class RelationshipManager(Star):
                                 f"🚫 Bot被拉入黑名单群 {group_id}\n"
                                 f"已发送提示并自动退出该群"
                             )
+                        else:
+                            # 有用户拉Bot进群，通知Bot主
+                            inviter_nickname = operator_id if operator_id else "未知"
+                            if operator_id:
+                                try:
+                                    info_res = await self._api("get_stranger_info", event=event, user_id=int(operator_id))
+                                    if self._api_ok(info_res):
+                                        info_data = self._api_data(info_res)
+                                        if isinstance(info_data, dict):
+                                            inviter_nickname = info_data.get("nickname", operator_id)
+                                except Exception:
+                                    pass
+
+                            group_name = group_id
+                            try:
+                                group_res = await self._api("get_group_info", event=event, group_id=int(group_id))
+                                if self._api_ok(group_res):
+                                    group_data = self._api_data(group_res)
+                                    if isinstance(group_data, dict):
+                                        group_name = group_data.get("group_name", group_id)
+                            except Exception:
+                                pass
+
+                            action = "拉入" if sub_type == "invite" else "加入"
+                            await self._notify(
+                                f"📥 Bot被{action}新群\n"
+                                f"群名称：{group_name}\n"
+                                f"群号：{group_id}\n"
+                                f"邀请人：{inviter_nickname} ({operator_id})\n"
+                                f"方式：{action}"
+                            )
+                            logger.info(
+                                f"Bot被{action}群 {group_id} ({group_name})，邀请人: {operator_id} ({inviter_nickname})"
+                            )
 
         except Exception as e:
             logger.error(f"处理通知事件异常: {e}")
