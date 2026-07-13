@@ -1589,58 +1589,59 @@ class RelationshipManager(Star):
 
                 elif notice_type == "group_increase":
                     sub_type = raw.get("sub_type", "")
-                    if user_id == self_id and group_id:
-                        if self._is_group_blocked(group_id):
+                    # 仅处理"invite"（有人拉Bot进群），且排除自己操作自己的情况
+                    if (
+                        user_id == self_id
+                        and group_id
+                        and sub_type == "invite"
+                        and operator_id != self_id
+                    ):
+                        # 获取操作者昵称（与参考插件 get_nickname 逻辑一致）
+                        operator_name = operator_id if operator_id else "未知"
+                        if operator_id:
                             try:
-                                await self._api(
-                                    "send_group_msg",
-                                    event=event,
-                                    group_id=int(group_id),
-                                    message="别老是让我进来又给我踢出去，烦不烦啊？！"
-                                )
-                                await asyncio.sleep(2)
-                                await self._api("set_group_leave", event=event, group_id=int(group_id))
-                            except Exception as notify_err:
-                                logger.error(f"黑名单群 {group_id} 退群异常: {notify_err}")
-                            logger.info(f"已自动退出黑名单群 {group_id}")
-                            await self._notify(
-                                f"🚫 Bot被拉入黑名单群 {group_id}\n"
-                                f"已发送提示并自动退出该群"
-                            )
-                        else:
-                            # 有用户拉Bot进群，通知Bot主
-                            inviter_nickname = operator_id if operator_id else "未知"
-                            if operator_id:
-                                try:
-                                    info_res = await self._api("get_stranger_info", event=event, user_id=int(operator_id))
-                                    if self._api_ok(info_res):
-                                        info_data = self._api_data(info_res)
-                                        if isinstance(info_data, dict):
-                                            inviter_nickname = info_data.get("nickname", operator_id)
-                                except Exception:
-                                    pass
-
-                            group_name = group_id
-                            try:
-                                group_res = await self._api("get_group_info", event=event, group_id=int(group_id))
-                                if self._api_ok(group_res):
-                                    group_data = self._api_data(group_res)
-                                    if isinstance(group_data, dict):
-                                        group_name = group_data.get("group_name", group_id)
+                                info_res = await self._api("get_stranger_info", event=event, user_id=int(operator_id))
+                                if self._api_ok(info_res):
+                                    info_data = self._api_data(info_res)
+                                    if isinstance(info_data, dict):
+                                        operator_name = info_data.get("nickname", operator_id)
                             except Exception:
                                 pass
 
-                            action = "拉入" if sub_type == "invite" else "加入"
-                            await self._notify(
-                                f"📥 Bot被{action}新群\n"
-                                f"群名称：{group_name}\n"
-                                f"群号：{group_id}\n"
-                                f"邀请人：{inviter_nickname} ({operator_id})\n"
-                                f"方式：{action}"
-                            )
-                            logger.info(
-                                f"Bot被{action}群 {group_id} ({group_name})，邀请人: {operator_id} ({inviter_nickname})"
-                            )
+                        # 获取群名称
+                        group_name = group_id
+                        try:
+                            group_res = await self._api("get_group_info", event=event, group_id=int(group_id))
+                            if self._api_ok(group_res):
+                                group_data = self._api_data(group_res)
+                                if isinstance(group_data, dict):
+                                    group_name = group_data.get("group_name", group_id)
+                        except Exception:
+                            pass
+
+                        # 构建通知消息（与参考插件 _handle_invited 格式一致）
+                        msg = f"Bot被 {operator_name}({operator_id}) 拉入 {group_name}({group_id})。"
+
+                        # 管理员拉群直接放行，其余人按规则过滤
+                        admins = self._get_admins()
+                        if operator_id not in admins:
+                            if self._is_group_blocked(group_id):
+                                msg += f"\n群聊 {group_name}({group_id}) 在黑名单里，已退群"
+                                try:
+                                    await self._api(
+                                        "send_group_msg",
+                                        event=event,
+                                        group_id=int(group_id),
+                                        message="别老是让我进来又给我踢出去，烦不烦啊？！"
+                                    )
+                                    await asyncio.sleep(2)
+                                    await self._api("set_group_leave", event=event, group_id=int(group_id))
+                                except Exception as notify_err:
+                                    logger.error(f"黑名单群 {group_id} 退群异常: {notify_err}")
+                                logger.info(f"已自动退出黑名单群 {group_id}")
+
+                        await self._notify(msg)
+                        logger.info(f"Bot被 {operator_name}({operator_id}) 拉入群 {group_name}({group_id})，已通知管理员")
 
         except Exception as e:
             logger.error(f"处理通知事件异常: {e}")
