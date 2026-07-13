@@ -1,4 +1,4 @@
-import json
+﻿import json
 import re
 import asyncio
 import uuid
@@ -928,6 +928,7 @@ class RelationshipManager(Star):
                 candidates.append(uid)
 
         for pattern in (
+            r"flag[:：]\s*([^\n\r]+)",
             r"编号[:：]\s*([^\n\r]+)",
             r"QQ号[:：]\s*([^\n\r]+)",
             r"邀请人QQ[:：]\s*([^\n\r]+)",
@@ -1004,6 +1005,9 @@ class RelationshipManager(Star):
         comment_match = re.search(r"验证(?:信息|消息)?[:：]\s*([^\n\r]+)", text)
         if comment_match:
             comment = comment_match.group(1).strip()
+        # 从通知文本提取 flag
+        flag_match = re.search(r"flag[:：]\s*([^\n\r]+)", text)
+        request_flag = flag_match.group(1).strip() if flag_match else uid
         return dict(
             type="friend",
             user_id=uid,
@@ -1012,7 +1016,7 @@ class RelationshipManager(Star):
             time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             notify_ids=[],
             request_id=uid,
-            request_flag=uid,
+            request_flag=request_flag,
             request_type="friend",
             request_api="set_friend_add_request",
             snowluma_direct_uin=True,
@@ -1080,6 +1084,14 @@ class RelationshipManager(Star):
         group_name = ""
         request_id = ""
 
+        # flag（server flag，用于API调用）
+        m = re.search(r"flag[:：]\s*([^\n\r]+)", text)
+        if m:
+            api_flag = m.group(1).strip()
+        else:
+            api_flag = ""
+            api_flag = ""
+
         # 编号（内部ID，非server flag）
         m = re.search(r"编号[:：]\s*([^\n\r]+)", text)
         if m:
@@ -1133,8 +1145,9 @@ class RelationshipManager(Star):
         if not gid and not uid:
             return None
 
-        # 确定用于API调用的flag：优先用gid，否则用uid
-        api_flag = gid or uid or ""
+        # 确定用于API调用的flag：优先用文本提取的flag，否则用gid，否则用uid
+        if not api_flag:
+            api_flag = gid or uid or ""
 
         return dict(
             type="group",
@@ -1453,11 +1466,10 @@ class RelationshipManager(Star):
 
         msg_ids = await self._notify_with_ids(
             f"【好友申请】同意/拒绝/拉黑：\n"
-            f"编号：{request_id}\n"
             f"昵称：{nickname}\n"
             f"QQ号：{uid}\n"
-            f"验证信息：{comment if comment else '无'}\n"
-            f"💬 引用此消息回复: /同意 或 /拒绝 或 /拉黑"
+            f"flag：{flag}\n"
+            f"验证信息：{comment if comment else '无'}"
         )
         if msg_ids:
             async with self._lock:
@@ -1542,13 +1554,12 @@ class RelationshipManager(Star):
 
         msg_ids = await self._notify_with_ids(
             f"【群邀请】同意/拒绝/拉黑：\n"
-            f"编号：{request_id}\n"
             f"邀请人昵称：{inviter_nickname}\n"
             f"邀请人QQ：{uid}\n"
             f"群名称：{group_name}\n"
             f"群号：{gid}\n"
-            f"验证信息：{comment if comment else '无'}\n"
-            f"💬 引用此消息回复: /同意 或 /拒绝 或 /拉黑"
+            f"flag：{flag}\n"
+            f"验证信息：{comment if comment else '无'}"
         )
         if msg_ids:
             async with self._lock:
@@ -1620,7 +1631,7 @@ class RelationshipManager(Star):
                             pass
 
                         # 构建通知消息（与参考插件 _handle_invited 格式一致）
-                        msg = f"Bot被 {operator_name}({operator_id}) 拉入 {group_name}({group_id})。"
+                        msg = f"主人..我被 {operator_name}({operator_id}) 拉进了 {group_name}({group_id})。"
 
                         # 管理员拉群直接放行，其余人按规则过滤
                         admins = self._get_admins()
@@ -1845,17 +1856,17 @@ class RelationshipManager(Star):
             yield event.plain_result("📋 无待处理请求\nSnowLuma 标准 request 事件和扩展过滤列表均未发现未处理申请")
             return
 
-        lines = ["📋 待处理请求（引用对应消息回复 /同意 或 /拒绝 或 /拉黑，或使用编号）"]
-        for flag, info in pending_snapshot.items():
+        lines = ["📋 待处理请求（引用对应消息回复 /同意 或 /拒绝 或 /拉黑，或使用编号/flag）"]
+        for flag_key, info in pending_snapshot.items():
             t = info.get("time", "?")
-            request_id = info.get("request_id", flag)
+            request_id = info.get("request_id", flag_key)
             if info["type"] == "friend":
                 nickname = info.get('nickname', info['user_id'])
                 comment = info.get('comment') or '无'
                 label = "可疑好友" if info.get("snowluma_doubt") else "好友"
                 id_label = "UID" if info.get("snowluma_doubt") else "QQ"
                 lines.append(
-                    f"🔹 {label} | 编号:{request_id} | 昵称:{nickname} {id_label}:{info['user_id']} | 验证:{comment} | {t}"
+                    f"🔹 {label} | 编号:{request_id} | flag:{flag_key} | 昵称:{nickname} {id_label}:{info['user_id']} | 验证:{comment} | {t}"
                 )
             else:
                 inviter_nickname = info.get('inviter_nickname', info['user_id'])
@@ -1863,7 +1874,7 @@ class RelationshipManager(Star):
                 comment = info.get('comment') or '无'
                 label = "过滤入群" if info.get("snowluma_filtered") else "群邀"
                 lines.append(
-                    f"🔸 {label} | 编号:{request_id} | 群:{group_name}({info['group_id']}) | 邀请人:{inviter_nickname}({info['user_id']}) | 验证:{comment} | {t}"
+                    f"🔸 {label} | 编号:{request_id} | flag:{flag_key} | 群:{group_name}({info['group_id']}) | 邀请人:{inviter_nickname}({info['user_id']}) | 验证:{comment} | {t}"
                 )
 
         yield event.plain_result("\n".join(lines))
@@ -2426,3 +2437,4 @@ class RelationshipManager(Star):
 
     async def terminate(self):
         logger.info("关系管理插件已停止")
+
