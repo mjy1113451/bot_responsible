@@ -34,7 +34,7 @@ except ImportError:
     "astrbot_plugin_relationship_manager",
     "mjy1113451",
     "AstrBot 关系管理插件",
-    "5.2.3",
+    "5.2.4",
     "https://github.com/mjy1113451/bot_responsible",
 )
 class RelationshipManager(Star):
@@ -71,7 +71,7 @@ class RelationshipManager(Star):
         self._patch_astrbot_message_session_id()
         self._cleanup_pending()
         logger.info(
-            "关系管理插件初始化完成 v5.2.3-snowluma-api-ok: data_dir=%s, pending_file=%s, pending_count=%s",
+            "关系管理插件初始化完成 v5.2.4-group-invite-filter: data_dir=%s, pending_file=%s, pending_count=%s",
             self.data_dir,
             self.pd_file,
             len(self.pending),
@@ -544,10 +544,10 @@ class RelationshipManager(Star):
         has_flag = bool(payload.get("flag"))
         has_user = bool(payload.get("user_id"))
         has_group = bool(payload.get("group_id"))
+        # 必须是 request 事件，避免误匹配普通消息里的字段
         return (
-            request_type == "friend"
+            (request_type == "friend" and has_flag and has_user and not has_group)
             or (post_type == "request" and has_flag and has_user and not has_group)
-            or (has_flag and has_user and not has_group)
         )
 
     @staticmethod
@@ -555,12 +555,12 @@ class RelationshipManager(Star):
         request_type = str(payload.get("request_type", "")).lower()
         post_type = str(payload.get("post_type", "")).lower()
         has_flag = bool(payload.get("flag"))
-        has_user = bool(payload.get("user_id"))
         has_group = bool(payload.get("group_id"))
+        # 必须是 request 事件；不要用 has_flag+group+user 宽松匹配，
+        # 否则群员拉人时的各种嵌套字段也会被当成“群邀请”
         return (
-            request_type == "group"
+            (request_type == "group" and has_flag and has_group)
             or (post_type == "request" and has_flag and has_group)
-            or (has_flag and has_group and has_user)
         )
 
     @staticmethod
@@ -1408,10 +1408,22 @@ class RelationshipManager(Star):
                 return None
 
             raw = self._extract_event_payload(event, self._looks_like_group_request)
-            if raw and str(raw.get("sub_type", "invite")).lower() == "invite":
-                logger.info("捕获群邀请事件: keys=%s", sorted(raw.keys()))
-                await self._on_group_invite(raw, event)
-                return None
+            if raw:
+                sub = str(raw.get("sub_type", "")).lower()
+                # 只处理「邀请 bot 入群」。群员拉其他用户时常见 sub_type=add，
+                # 或 bot 已在群内的 invite 审批请求，均不应发【群邀请】通知。
+                if sub == "invite":
+                    logger.info("捕获群邀请事件: keys=%s", sorted(raw.keys()))
+                    await self._on_group_invite(raw, event)
+                    return None
+                if sub == "add":
+                    logger.info(
+                        "忽略入群申请事件(sub_type=add，非 bot 被邀请): group_id=%s, user_id=%s, flag=%s",
+                        raw.get("group_id"),
+                        raw.get("user_id"),
+                        raw.get("flag"),
+                    )
+                    return None
         except Exception as e:
             logger.error(f"处理请求事件异常: {e}")
 
@@ -1479,18 +1491,44 @@ class RelationshipManager(Star):
         else:
             logger.warning(f"好友申请通知未获取到可匹配的消息ID: flag={flag}, uid={uid}")
 
+    async def _bot_already_in_group(self, event: AstrMessageEvent, gid: str) -> bool:
+        """判断 bot 是否已在该群。已在群内时的 invite/add 是审批别人，不是 bot 被邀请。"""
+        if not gid:
+            return False
+        try:
+            res = await self._api("get_group_list", event=event, no_cache=False)
+            groups = self._api_list(res) if res is not None else []
+            for g in groups:
+                if str(g.get("group_id", "")).strip() == str(gid).strip():
+                    return True
+        except Exception as e:
+            logger.debug(f"检查 bot 是否在群 {gid} 失败: {e}")
+        return False
+
     async def _on_group_invite(self, raw: dict, event: AstrMessageEvent = None):
         """
-        修复4: uid="0"（机器人主动申请加群）场景单独处理，
-        走 group_blacklist 校验而非 user blacklist
+        仅处理「邀请 bot 入群」：
+        - 群员拉其他用户 / bot 已在群内的入群审批 → 直接忽略，不发【群邀请】
+        - uid="0"（机器人主动申请加群）走 group_blacklist 校验
         """
         uid = str(raw.get("user_id", ""))
         gid = str(raw.get("group_id", ""))
         flag = str(raw.get("flag", ""))
         comment = raw.get("comment", "") or ""
-        sub = raw.get("sub_type", "invite")
+        sub = str(raw.get("sub_type", "invite") or "invite").lower()
         request_id = self._new_request_id()
         if not flag:
+            return
+
+        # 明确不是 invite 的请求（如 add 入群申请）不作为 bot 群邀请
+        if sub != "invite":
+            logger.info(f"跳过非 bot 群邀请: sub_type={sub}, gid={gid}, uid={uid}, flag={flag}")
+            return
+
+        # flag 形如 add:... 时是别人申请入群，不是邀请 bot
+        flag_lower = flag.lower()
+        if flag_lower.startswith("add:"):
+            logger.info(f"跳过入群申请 flag: gid={gid}, uid={uid}, flag={flag}")
             return
 
         if uid and not self._valid_uid(uid):
@@ -1498,6 +1536,14 @@ class RelationshipManager(Star):
             return
         if gid and not self._valid_gid(gid):
             logger.warning(f"群邀请 gid 格式异常，已忽略: {gid}")
+            return
+
+        # bot 已在群内 → 这是群员拉其他人 / 入群审批，不是 bot 被邀请
+        if await self._bot_already_in_group(event, gid):
+            logger.info(
+                "跳过群内成员拉人事件(bot已在群内，非 bot 被邀请): gid=%s, uid=%s, flag=%s",
+                gid, uid, flag,
+            )
             return
 
         # uid="0" 表示机器人主动申请加群，跳过用户黑名单校验，只走群黑名单
