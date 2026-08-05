@@ -68,10 +68,11 @@ class RelationshipManager(Star):
         self._migrate_blacklist()
 
         self.notify_group: Optional[str] = config.get("notify_group", None)
+        raw_history_count = config.get("ban_forward_history_count", 20)
         try:
-            self.ban_forward_history_count = max(
-                0, min(100, int(config.get("ban_forward_history_count", 20)))
-            )
+            if raw_history_count is None or str(raw_history_count).strip() == "":
+                raw_history_count = 20
+            self.ban_forward_history_count = max(0, min(100, int(raw_history_count)))
         except Exception:
             self.ban_forward_history_count = 20
         self._group_message_history: Dict[str, Deque[dict]] = {}
