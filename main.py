@@ -469,6 +469,128 @@ class RelationshipManager(Star):
             pass
         return None
 
+    @staticmethod
+    def _extract_image_url_from_node(node: Any, seen: Set[int] = None) -> Optional[str]:
+        """从 AstrBot 消息链 / OneBot segment / CQ 码中提取图片 URL 或 file。"""
+        if seen is None:
+            seen = set()
+        if node is None:
+            return None
+        if isinstance(node, (int, float, bool, bytes)):
+            return None
+
+        node_id = id(node)
+        if node_id in seen:
+            return None
+        seen.add(node_id)
+
+        if isinstance(node, str):
+            # OneBot CQ 码: [CQ:image,file=...,url=...]
+            for match in re.finditer(r"\[CQ:image,([^\]]+)\]", node):
+                attrs = {}
+                for part in match.group(1).split(","):
+                    if "=" in part:
+                        key, value = part.split("=", 1)
+                        attrs[key.strip()] = value.strip()
+                img = attrs.get("url") or attrs.get("file")
+                if img:
+                    return img.replace("&amp;", "&")
+            return None
+
+        if isinstance(node, dict):
+            node_type = str(node.get("type", "") or node.get("component_type", "")).lower()
+            data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            if node_type == "image":
+                img = (
+                    data.get("url")
+                    or data.get("file")
+                    or data.get("path")
+                    or node.get("url")
+                    or node.get("file")
+                    or node.get("path")
+                )
+                if img:
+                    return str(img).replace("&amp;", "&")
+            for key in ("chain", "message", "messages", "raw_message", "data", "content", "reply", "source", "quote"):
+                result = RelationshipManager._extract_image_url_from_node(node.get(key), seen)
+                if result:
+                    return result
+            for value in node.values():
+                result = RelationshipManager._extract_image_url_from_node(value, seen)
+                if result:
+                    return result
+            return None
+
+        if isinstance(node, (list, tuple, set)):
+            for item in node:
+                result = RelationshipManager._extract_image_url_from_node(item, seen)
+                if result:
+                    return result
+            return None
+
+        class_name = node.__class__.__name__.lower()
+        component_type = str(getattr(node, "type", "") or getattr(node, "component_type", "")).lower()
+        if "image" in class_name or component_type == "image":
+            for attr in ("url", "file", "path"):
+                img = getattr(node, attr, None)
+                if img:
+                    return str(img).replace("&amp;", "&")
+            data = getattr(node, "data", None)
+            result = RelationshipManager._extract_image_url_from_node(data, seen)
+            if result:
+                return result
+
+        # Reply 组件通常挂 chain; AstrBotMessage / event 挂 message_obj/raw_message 等
+        for attr in (
+            "chain", "message", "messages", "raw_message", "data", "content",
+            "reply", "source", "quote", "message_obj",
+        ):
+            try:
+                result = RelationshipManager._extract_image_url_from_node(getattr(node, attr, None), seen)
+                if result:
+                    return result
+            except Exception:
+                continue
+        return None
+
+    def _extract_image_url_from_event(self, event: AstrMessageEvent) -> Optional[str]:
+        candidates = []
+        for getter in ("get_messages", "get_message"):
+            try:
+                if hasattr(event, getter):
+                    candidates.append(getattr(event, getter)())
+            except Exception:
+                pass
+        candidates.extend([
+            getattr(event, "message_obj", None),
+            getattr(event, "message_str", None),
+            getattr(getattr(event, "message_obj", None), "raw_message", None),
+            event,
+        ])
+        for candidate in candidates:
+            result = self._extract_image_url_from_node(candidate)
+            if result:
+                return result
+        return None
+
+    async def _set_qq_nickname(self, event: AstrMessageEvent, new_name: str) -> Any:
+        """设置 Bot QQ 昵称。
+
+        优先使用 astrbot_plugin_qqprofile 验证可用的 NapCat/aiocqhttp 参数
+        ``nickname=...``;若平台不支持,再回退到旧版 profile_type/profile_value
+        参数形态。
+        """
+        res = await self._api("set_qq_profile", event=event, nickname=new_name)
+        if self._api_ok(res):
+            return res
+        logger.warning("set_qq_profile(nickname=...) 失败,尝试 profile_type/profile_value: %s", res)
+        return await self._api(
+            "set_qq_profile",
+            event=event,
+            profile_type="nickname",
+            profile_value=new_name,
+        )
+
     def _looks_like_group_message(self, payload: dict) -> bool:
         post_type = str(payload.get("post_type", "")).lower()
         message_type = str(payload.get("message_type", "")).lower()
@@ -2326,12 +2448,7 @@ class RelationshipManager(Star):
         api_error: Optional[str] = None
         api_returned_failure = False
         try:
-            r = await self._api(
-                "set_qq_profile",
-                event=event,
-                profile_type="nickname",
-                profile_value=new_name,
-            )
+            r = await self._set_qq_nickname(event, new_name)
             if not self._api_ok(r):
                 api_returned_failure = True
                 api_error = self._api_failure_text(r)
@@ -2398,6 +2515,48 @@ class RelationshipManager(Star):
             f"✅ set_qq_profile 调用成功: {new_name}\n"
             f"(未能读取当前昵称以验证,请到 QQ 上确认是否生效)"
         )
+
+    @filter.command("设置头像", alias=["QQ头像", "改头像", "setavatar"])
+    async def cmd_set_qq_avatar(self, event: AstrMessageEvent, args: str = ""):
+        """修改 bot 自身的 QQ 头像
+
+        用法:
+        - 发送图片并附带 /设置头像
+        - 引用一张图片回复 /设置头像 设置
+
+        移植自 astrbot_plugin_qqprofile 的 set_qq_avatar(file=...) 路径。
+        """
+        if self._sender_blocked(event):
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 仅 Astrbot 内置 bot 主可用")
+            return
+
+        img_url = self._extract_image_url_from_event(event)
+        if not img_url:
+            yield event.plain_result(
+                "⚠️ 需要发送或引用一张图片\n"
+                "用法: 引用图片回复 /设置头像 设置"
+            )
+            return
+
+        try:
+            r = await self._api("set_qq_avatar", event=event, file=img_url)
+        except Exception as e:
+            logger.error(f"set_qq_avatar 调用异常: {e}")
+            yield event.plain_result(
+                f"❌ 修改头像失败: {e}\n"
+                f"请确认当前平台支持 set_qq_avatar action。"
+            )
+            return
+
+        if self._api_ok(r):
+            yield event.plain_result("✅ 我换头像啦~")
+        else:
+            yield event.plain_result(
+                f"❌ 修改头像失败: {self._api_failure_text(r)}\n"
+                f"请确认平台支持 set_qq_avatar,且图片 URL/文件可被协议端访问。"
+            )
 
     @filter.command("删好友", alias=["deletefriend"])
     async def cmd_del_friend(self, event: AstrMessageEvent, args: str = ""):

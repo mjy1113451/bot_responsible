@@ -78,6 +78,8 @@ git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relat
 | `/加群` | `/addgroup` | 加入群组；SnowLuma 下走实验性 `send_packet` | 管理员 |
 | `/删好友` | `/deletefriend` | 删除好友 | 管理员 |
 | `/退群` | `/leavegroup` | 退出群组 | 管理员 |
+| `/QQ昵称` | `/qqnickname`, `/setnickname`, `/改昵称` | 修改 Bot 的 QQ 昵称 | 管理员 |
+| `/设置头像` | `/QQ头像`, `/改头像`, `/setavatar` | 引用/发送图片修改 Bot 的 QQ 头像 | 管理员 |
 | `/同意` | `/accept` | 同意请求；支持引用通知或 `/同意 编号` | 管理员 |
 | `/拒绝` | `/reject` | 拒绝请求；支持引用通知或 `/拒绝 编号` | 管理员 |
 | `/拉黑请求` | `/blockreply` | 拒绝并拉黑请求；支持引用通知或 `/拉黑请求 编号` | 管理员 |
@@ -89,6 +91,16 @@ git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relat
 ```
 /拉黑 123456789
 /拉黑 123456789 987654321  # 批量拉黑
+```
+
+#### 设置 Bot 昵称 / 头像
+```
+/QQ昵称 守护姬
+```
+
+设置头像：发送或引用一张图片后回复：
+```
+/设置头像 设置
 ```
 
 #### 处理好友申请
