@@ -2407,6 +2407,12 @@ class RelationshipManager(Star):
                             logger.info(
                                 f"Bot 自行离开群 {group_id}（解散/主动退群），跳过被踢通知与拉黑"
                             )
+                        # #69（owner 澄清）：操作者为 bot 主（管理员名单）时属主动操作，
+                        # 不通知也不拉黑
+                        elif operator_id and operator_id in self._get_admins():
+                            logger.info(
+                                f"Bot 被 bot 主 {operator_id} 踢出群 {group_id}（主动操作），跳过通知与拉黑"
+                            )
                         elif group_id:
                             self._add_group_to_blacklist(group_id)
                             logger.info(f"Bot被踢出群 {group_id}，已将该群加入黑名单")
@@ -2423,13 +2429,19 @@ class RelationshipManager(Star):
                     # issue #57: Bot 被解除禁言时通知 bot 主
                     sub_type = raw.get("sub_type", "")
                     if sub_type == "ban" and user_id == self_id:
-                        operator_name = await self._resolve_user_name(event, operator_id)
-                        msg = (
-                            f"呜呜呜X﹏X！我在{group_id}被{operator_name}"
-                            f"{operator_id}禁言了！"
-                        )
-                        await self._notify(msg)
-                        await self._send_ban_history_forward(event, group_id)
+                        # #69（owner 澄清）：bot 主禁言属主动操作，不通知也不转发禁言前记录
+                        if operator_id and operator_id in self._get_admins():
+                            logger.info(
+                                f"Bot 被 bot 主 {operator_id} 在群 {group_id} 禁言（主动操作），跳过通知与转发"
+                            )
+                        else:
+                            operator_name = await self._resolve_user_name(event, operator_id)
+                            msg = (
+                                f"呜呜呜X﹏X！我在{group_id}被{operator_name}"
+                                f"{operator_id}禁言了！"
+                            )
+                            await self._notify(msg)
+                            await self._send_ban_history_forward(event, group_id)
                     # issue #57: Bot 被解除禁言时通知 bot 主
                     elif sub_type == "lift_ban" and user_id == self_id:
                         if not group_id:
@@ -2455,12 +2467,18 @@ class RelationshipManager(Star):
 
                 elif notice_type == "group_increase":
                     sub_type = raw.get("sub_type", "")
-                    # 仅处理"invite"（有人拉Bot进群），且排除自己操作自己的情况
+                    # 仅处理"别人拉 Bot 进群"；#69：放宽 sub_type 限制
+                    # （部分 OneBot 实现的拉群事件 sub_type 为 invite/approve 或空）
+                    # review#72：空 sub_type 仅在 operator_id 存在（字段确有上报）时放行，
+                    # 避免把字段缺失/主动加群的 group_increase 误判为被人邀请
                     if (
                         user_id == self_id
                         and group_id
-                        and sub_type == "invite"
                         and operator_id != self_id
+                        and (
+                            sub_type in ("invite", "approve")
+                            or (sub_type == "" and operator_id)
+                        )
                     ):
                         # 获取操作者昵称（与参考插件 get_nickname 逻辑一致）
                         operator_name = operator_id if operator_id else "未知"
@@ -2490,7 +2508,12 @@ class RelationshipManager(Star):
 
                         # 管理员拉群直接放行，其余人按规则过滤
                         admins = self._get_admins()
-                        if operator_id not in admins:
+                        # #69（owner 澄清）：bot 主拉群属主动操作，不通知
+                        if operator_id in admins:
+                            logger.info(
+                                f"Bot 被 bot 主 {operator_id} 拉入群 {group_name}({group_id})（主动操作），跳过通知"
+                            )
+                        else:
                             if self._is_group_blocked(group_id):
                                 msg += f"\n群聊 {group_name}({group_id}) 在黑名单里，已退群"
                                 try:
@@ -2506,8 +2529,8 @@ class RelationshipManager(Star):
                                     logger.error(f"黑名单群 {group_id} 退群异常: {notify_err}")
                                 logger.info(f"已自动退出黑名单群 {group_id}")
 
-                        await self._notify(msg)
-                        logger.info(f"Bot被 {operator_name}({operator_id}) 拉入群 {group_name}({group_id})，已通知管理员")
+                            await self._notify(msg)
+                            logger.info(f"Bot被 {operator_name}({operator_id}) 拉入群 {group_name}({group_id})，已通知管理员")
 
         except Exception as e:
             logger.error(f"处理通知事件异常: {e}")
