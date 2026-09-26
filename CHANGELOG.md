@@ -1,5 +1,7 @@
 📋 版本历史
 
+v5.2.15：修复 Bot 被禁言后只收到禁言通知、收不到聊天记录合并转发的问题（#73）。`_send_ban_history_forward` 的收件人此前与文本通知 `_notify_with_ids` 不一致：配置了 `notify_group` 时只往通知群发群合并转发，不配 `notify_group` 时只发 `admins_id`，`notify_qq` 里的 bot 主一律收不到。现与文本通知收件人完全对齐——配了 `notify_group` 时群转发 + `notify_qq` 私聊合并转发副本，未配时按 `notify_qq > admins_id` 优先级逐个私聊合并转发。
+
 v5.2.14：修复 v5.2.13 引入的回归——`_cache_self_group_message()` 签名漏了 `dedup_key` 形参，导致所有 bot 发言缓存调用抛 TypeError 被静默吞掉，禁言转发里 bot 发言仍然缺失（#63）。本版修正签名，bot 发言缓存恢复正常。
 
 v5.2.13：修复开启流式输出时禁言转发的聊天记录仍看不到 bot 的 LLM 回复（#63）。新增 on_llm_response 钩子：LLM 回复完成时（流式/非流式均触发）把 bot 发言写入禁言转发缓存，覆盖 on_decorating_result 钩子够不到的 send_streaming、工具直发等出站路径；多个出站钩子捕获同一条消息时按文本指纹在 10 秒内去重，避免转发记录里同一条发言重复出现。

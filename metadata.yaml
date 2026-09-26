@@ -1,6 +1,6 @@
 name: astrbot_plugin_relationship_manager
 display_name: 人际关系合集
 desc: 支持加好友/加群/处理好友申请/修改好友备注/修改bot的qq昵称/处理好友申请/处理群申请/抽查群或好友聊天记录/拉黑好友/退群/改头像和昵称/解封(黑名单中好友)/拉黑群/解封群(黑名单中群)
-version: v5.2.14
+version: v5.2.15
 author: mjy1113451
 repo: https://github.com/mjy1113451/bot_responsible

@@ -1,4 +1,4 @@
-﻿import json
+import json
 import re
 import asyncio
 import time
@@ -965,6 +965,17 @@ class RelationshipManager(Star):
         fallback_text = self._history_to_text(history, str(group_id))
         client = self._get_client(event)
 
+        # issue #73: 合并转发的收件人必须和文本通知(_notify_with_ids)保持一致,
+        # 否则只配了 notify_qq 的 bot 主只会收到禁言通知、收不到聊天记录。
+        # 优先级: 配置 notify_qq > admins_id
+        private_targets: List[str] = []
+        for q in self._notify_qqs:
+            if q and q not in private_targets:
+                private_targets.append(q)
+        for aid in self._get_admins():
+            if aid and aid not in private_targets:
+                private_targets.append(aid)
+
         sent = False
         if client:
             try:
@@ -978,18 +989,30 @@ class RelationshipManager(Star):
                     sent = self._api_ok(res)
                     if not sent:
                         logger.warning(f"发送群合并转发失败: {res}")
-                else:
-                    for aid in self._get_admins():
+                    # 群通知场景下,notify_qq 仍可同时收到私聊合并转发副本(与文本通知一致)
+                    for q in self._notify_qqs:
                         res = await self._api(
                             "send_private_forward_msg",
                             event=event,
-                            user_id=int(aid),
+                            user_id=int(q),
                             messages=nodes,
                         )
                         if self._api_ok(res):
                             sent = True
                         else:
-                            logger.warning(f"发送私聊合并转发失败: aid={aid}, response={res}")
+                            logger.warning(f"发送私聊合并转发失败: qq={q}, response={res}")
+                else:
+                    for q in private_targets:
+                        res = await self._api(
+                            "send_private_forward_msg",
+                            event=event,
+                            user_id=int(q),
+                            messages=nodes,
+                        )
+                        if self._api_ok(res):
+                            sent = True
+                        else:
+                            logger.warning(f"发送私聊合并转发失败: qq={q}, response={res}")
             except Exception as e:
                 logger.error(f"发送禁言前合并转发异常: {e}")
 
