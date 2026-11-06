@@ -14,6 +14,10 @@ from astrbot.api.platform import MessageType
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
+# 插件版本的代码侧唯一来源，必须与 metadata.yaml 的 version 保持一致。
+# 升级时只改这里和 metadata.yaml 两处，避免日志/横幅等处出现版本号副本。
+PLUGIN_VERSION = "5.2.14"
+
 # 尝试导入 AiocqhttpMessageEvent（用于类型提示）
 try:
     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
@@ -37,7 +41,7 @@ except ImportError:
     "astrbot_plugin_relationship_manager",
     "mjy1113451",
     "AstrBot 关系管理插件",
-    "5.2.14",
+    PLUGIN_VERSION,
     "https://github.com/mjy1113451/bot_responsible",
 )
 class RelationshipManager(Star):
@@ -101,7 +105,8 @@ class RelationshipManager(Star):
         self._patch_astrbot_message_session_id()
         self._cleanup_pending()
         logger.info(
-            "关系管理插件初始化完成 v5.2.14: data_dir=%s, pending_file=%s, pending_count=%s",
+            "关系管理插件初始化完成 v%s: data_dir=%s, pending_file=%s, pending_count=%s",
+            PLUGIN_VERSION,
             self.data_dir,
             self.pd_file,
             len(self.pending),
