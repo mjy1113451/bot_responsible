@@ -87,6 +87,19 @@ class RelationshipManager(Star):
                 if text and self._valid_gid(text):
                     self.blacklist_groups.append(text)
 
+        # issue #76: gg 公告广播排除群（这些群不参与广播发送）。
+        self.broadcast_exclude_groups: List[str] = []
+        raw_beg = config.get("broadcast_exclude_groups", [])
+        if isinstance(raw_beg, str):
+            raw_beg = [x for x in re.split(r"[\s,，、]+", raw_beg) if x]
+        if isinstance(raw_beg, list):
+            for item in raw_beg:
+                if item is None:
+                    continue
+                text = str(item).strip()
+                if text and self._valid_gid(text):
+                    self.broadcast_exclude_groups.append(text)
+
         self.notify_group: Optional[str] = config.get("notify_group", None)
         self._notify_qqs: List[str] = []
         raw_notify_qqs = config.get("notify_qq", [])
@@ -2829,6 +2842,8 @@ class RelationshipManager(Star):
         for g in group_items:
             gid = str(g.get("group_id") or "").strip()
             if not gid:
+                continue
+            if gid in self.broadcast_exclude_groups:
                 continue
             sent = False
             for _ in range(3):
