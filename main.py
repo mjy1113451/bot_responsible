@@ -74,9 +74,18 @@ class RelationshipManager(Star):
         self._migrate_blacklist()
 
         # issue #74: LLM 恢复黑名单群。群号在该列表中时，即使 AstrBot 开启了
-        # 内置 LLM 恢复，bot 在该群也不回复任何消息。
-        self.bgg_file = self.data_dir / "blacklist_groups.json"
-        self.blacklist_groups: List[str] = self._load(self.bgg_file, [])
+        # 内置 LLM 恢复，bot 在该群也不回复任何消息。配置项存放在插件配置里。
+        self.blacklist_groups: List[str] = []
+        raw_bgg = config.get("blacklist_groups", [])
+        if isinstance(raw_bgg, str):
+            raw_bgg = [x for x in re.split(r"[\s,，、]+", raw_bgg) if x]
+        if isinstance(raw_bgg, list):
+            for item in raw_bgg:
+                if item is None:
+                    continue
+                text = str(item).strip()
+                if text and self._valid_gid(text):
+                    self.blacklist_groups.append(text)
 
         self.notify_group: Optional[str] = config.get("notify_group", None)
         self._notify_qqs: List[str] = []
@@ -2777,7 +2786,9 @@ class RelationshipManager(Star):
                 else:
                     self.blacklist_groups.append(g)
                     added.append(g)
-            self._save(self.bgg_file, self.blacklist_groups)
+            config = self.context.get_config()
+            config["blacklist_groups"] = self.blacklist_groups
+            self.context.set_config(config)
 
         parts = []
         if added:
