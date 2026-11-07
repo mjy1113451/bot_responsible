@@ -14,6 +14,10 @@ from astrbot.api.platform import MessageType
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
+# 插件版本的代码侧唯一来源，必须与 metadata.yaml 的 version 保持一致。
+# 升级时只改这里和 metadata.yaml 两处，避免日志/横幅等处出现版本号副本。
+PLUGIN_VERSION = "5.2.14"
+
 # 尝试导入 AiocqhttpMessageEvent（用于类型提示）
 try:
     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
@@ -37,7 +41,7 @@ except ImportError:
     "astrbot_plugin_relationship_manager",
     "mjy1113451",
     "AstrBot 关系管理插件",
-    "5.2.14",
+    PLUGIN_VERSION,
     "https://github.com/mjy1113451/bot_responsible",
 )
 class RelationshipManager(Star):
@@ -68,6 +72,33 @@ class RelationshipManager(Star):
         self.blacklist: Dict[str, dict] = self._load(self.bl_file, {})
         self.pending: Dict[str, dict] = self._load(self.pd_file, {})
         self._migrate_blacklist()
+
+        # issue #74: LLM 恢复黑名单群。群号在该列表中时，即使 AstrBot 开启了
+        # 内置 LLM 恢复，bot 在该群也不回复任何消息。配置项存放在插件配置里。
+        self.blacklist_groups: List[str] = []
+        raw_bgg = config.get("blacklist_groups", [])
+        if isinstance(raw_bgg, str):
+            raw_bgg = [x for x in re.split(r"[\s,，、]+", raw_bgg) if x]
+        if isinstance(raw_bgg, list):
+            for item in raw_bgg:
+                if item is None:
+                    continue
+                text = str(item).strip()
+                if text and self._valid_gid(text):
+                    self.blacklist_groups.append(text)
+
+        # issue #76: gg 公告广播排除群（这些群不参与广播发送）。
+        self.broadcast_exclude_groups: List[str] = []
+        raw_beg = config.get("broadcast_exclude_groups", [])
+        if isinstance(raw_beg, str):
+            raw_beg = [x for x in re.split(r"[\s,，、]+", raw_beg) if x]
+        if isinstance(raw_beg, list):
+            for item in raw_beg:
+                if item is None:
+                    continue
+                text = str(item).strip()
+                if text and self._valid_gid(text):
+                    self.broadcast_exclude_groups.append(text)
 
         self.notify_group: Optional[str] = config.get("notify_group", None)
         self._notify_qqs: List[str] = []
@@ -101,7 +132,8 @@ class RelationshipManager(Star):
         self._patch_astrbot_message_session_id()
         self._cleanup_pending()
         logger.info(
-            "关系管理插件初始化完成 v5.2.14: data_dir=%s, pending_file=%s, pending_count=%s",
+            "关系管理插件初始化完成 v%s: data_dir=%s, pending_file=%s, pending_count=%s",
+            PLUGIN_VERSION,
             self.data_dir,
             self.pd_file,
             len(self.pending),
@@ -959,15 +991,18 @@ class RelationshipManager(Star):
         """发送 Bot 被禁言前的聊天记录合并转发。"""
         count = self.ban_forward_history_count
         if count <= 0:
+            logger.info(f"群 {group_id} 禁言转发已禁用（ban_forward_history_count=0）")
             return
         history = list(self._group_message_history.get(str(group_id), []))[-count:]
-        nodes = self._build_forward_nodes(history, str(group_id))
+        if not history:
+            logger.warning(f"群 {group_id} 禁言前无缓存聊天记录，仅发送通知")
         fallback_text = self._history_to_text(history, str(group_id))
         client = self._get_client(event)
 
         sent = False
         if client:
             try:
+                nodes = self._build_forward_nodes(history, str(group_id))
                 if self.notify_group:
                     res = await self._api(
                         "send_group_forward_msg",
@@ -2156,6 +2191,16 @@ class RelationshipManager(Star):
 
     @filter.event_message_type(EventMessageType.ALL)
     async def handle_event(self, event: AstrMessageEvent) -> Optional[AstrMessageEvent]:
+        # issue #74: 命中 LLM 恢复黑名单群时直接丢弃事件，bot 不做任何回复。
+        try:
+            if event.get_message_type() == MessageType.GROUP_MESSAGE:
+                gid = str(event.get_group_id() or "").strip()
+                if gid and gid in self.blacklist_groups:
+                    logger.info(f"群 {gid} 在 LLM 恢复黑名单中，屏蔽本次消息")
+                    return None
+        except Exception:
+            pass
+
         try:
             self._cache_group_message(event)
         except Exception as e:
@@ -2712,6 +2757,137 @@ class RelationshipManager(Star):
             gi = "✅" if info.get("block_group_invite", True) else "❌"
             lines.append(f"- {uid} | 消息{m} 好友{fr} 群邀请{gi}")
 
+        yield event.plain_result("\n".join(lines))
+
+    # ───────── LLM 恢复黑名单群 (#74) ─────────
+
+    @filter.command("黑名单群号", alias=["bgg", "群黑名单"])
+    async def cmd_blacklist_groups(self, event: AstrMessageEvent, args: str = ""):
+        if self._sender_blocked(event):
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 仅管理员可用")
+            return
+
+        targets = [t for t in re.split(r"[\s,，、]+", args.strip()) if t]
+        if not targets:
+            if not self.blacklist_groups:
+                yield event.plain_result("📋 LLM 恢复黑名单群为空")
+            else:
+                lines = ["🚫 LLM 恢复黑名单群:"]
+                lines.extend(f"- {g}" for g in self.blacklist_groups)
+                yield event.plain_result("\n".join(lines))
+            return
+
+        valid, invalid = [], []
+        for g in targets:
+            if self._valid_gid(g):
+                valid.append(g)
+            else:
+                invalid.append(g)
+        if invalid:
+            yield event.plain_result(f"⚠️ 群号格式无效: {', '.join(invalid)}")
+            if not valid:
+                return
+
+        added, removed = [], []
+        async with self._lock:
+            for g in valid:
+                if g in self.blacklist_groups:
+                    self.blacklist_groups.remove(g)
+                    removed.append(g)
+                else:
+                    self.blacklist_groups.append(g)
+                    added.append(g)
+            config = self.context.get_config()
+            config["blacklist_groups"] = self.blacklist_groups
+            self.context.set_config(config)
+
+        parts = []
+        if added:
+            parts.append(f"✅ 已加入黑名单群: {', '.join(added)}（该群开启 LLM 恢复也不会回复）")
+        if removed:
+            parts.append(f"♻️ 已移出黑名单群: {', '.join(removed)}")
+        yield event.plain_result("\n".join(parts))
+
+    # ───────── 群公告广播 (#76) ─────────
+
+    @filter.command("gg", alias=["公告", "broadcast"])
+    async def cmd_broadcast(self, event: AstrMessageEvent, args: str = ""):
+        if self._sender_blocked(event):
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 仅管理员可用")
+            return
+
+        content = args.strip()
+        if not content:
+            yield event.plain_result("⚠️ 用法：gg 公告内容")
+            return
+
+        self_id = await self._resolve_self_id(event) or "bot"
+        text = f"{self_id}发布了公告：\n{content}"
+
+        ok_groups: List[str] = []
+        fail_groups: List[str] = []
+        ok_friends: List[str] = []
+        fail_friends: List[str] = []
+
+        groups = await self._api("get_group_list", event=event)
+        group_items = []
+        if self._api_ok(groups):
+            data = self._api_data(groups)
+            if isinstance(data, list):
+                group_items = data
+        for g in group_items:
+            gid = str(g.get("group_id") or "").strip()
+            if not gid:
+                continue
+            if gid in self.broadcast_exclude_groups:
+                continue
+            sent = False
+            for _ in range(3):
+                try:
+                    res = await self._api("send_group_msg", event=event,
+                                          group_id=int(gid), message=text)
+                    if self._api_ok(res):
+                        sent = True
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.3)
+            (ok_groups if sent else fail_groups).append(gid)
+
+        friends = await self._api("get_friend_list", event=event)
+        friend_items = []
+        if self._api_ok(friends):
+            data = self._api_data(friends)
+            if isinstance(data, list):
+                friend_items = data
+        for f in friend_items:
+            fid = str(f.get("user_id") or "").strip()
+            if not fid:
+                continue
+            sent = False
+            for _ in range(3):
+                try:
+                    res = await self._api("send_private_msg", event=event,
+                                          user_id=int(fid), message=text)
+                    if self._api_ok(res):
+                        sent = True
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.3)
+            (ok_friends if sent else fail_friends).append(fid)
+
+        lines = [f"📢 公告已发送：\n{content}", ""]
+        lines.append(f"群：成功 {len(ok_groups)}，失败 {len(fail_groups)}")
+        if fail_groups:
+            lines.append("失败群号：" + ", ".join(fail_groups))
+        lines.append(f"好友：成功 {len(ok_friends)}，失败 {len(fail_friends)}")
+        if fail_friends:
+            lines.append("失败QQ号：" + ", ".join(fail_friends))
         yield event.plain_result("\n".join(lines))
 
     # ───────── 待处理 ─────────

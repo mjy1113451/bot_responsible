@@ -23,5 +23,19 @@
     "type": "int",
     "hint": "Bot 被群禁言时，向 bot 主/通知群合并转发禁言前最近 N 条群聊记录。设为 0 可关闭聊天记录转发，最大 100。",
     "default": 20
+  },
+  "blacklist_groups": {
+    "description": "LLM 恢复黑名单群号列表",
+    "type": "list",
+    "items": {"type": "string"},
+    "hint": "在这些群里，即使 AstrBot 开启了内置 LLM 恢复，bot 也不会回复任何消息。可在 WebUI 填写，或用指令「黑名单群号 群号」增删（重复传入自动切换）。",
+    "default": []
+  },
+  "broadcast_exclude_groups": {
+    "description": "gg 公告广播排除群号列表",
+    "type": "list",
+    "items": {"type": "string"},
+    "hint": "使用 gg/公告 指令群发公告时，这些群不会收到公告。群号为 5-12 位数字。",
+    "default": []
   }
 }
