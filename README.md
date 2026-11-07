@@ -186,6 +186,10 @@ git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relat
 ## 🐛 已知问题
 
 - `/加好友`、`/加群` 不是 OneBot v11 标准 action。SnowLuma 提供 `send_packet`，但这里的主动添加逻辑仍属于原始包实验路径，可能因 QQ/SnowLuma 版本变化失效。
+- 禁言转发/抽查中缺失 bot 自己的发言（#70，needs-info）时，可按以下顺序排查：
+  1. 确认 `ban_forward_history_count > 0`（为 0 时缓存整体关闭）；
+  2. 日志中搜「已缓存 bot 群消息」——没有说明出站缓存钩子未触发（多为 self_id 解析失败，搜「缓存 bot 自身群消息跳过」）；
+  3. 日志中搜「跳过重复缓存」——10 秒去重窗口内同内容的多次发言只会缓存一条。
 
 ## 🤝 贡献
 

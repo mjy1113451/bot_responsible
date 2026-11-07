@@ -871,6 +871,9 @@ class RelationshipManager(Star):
             "name": str(self_nickname or self._self_nickname or "bot"),
             "content": content,
         })
+        # issue #70：bot 自身发言缓存成功也落一条日志（截断防刷屏），
+        # bot 发言在禁言转发/抽查中缺失时，可以从日志确认缓存钩子是否触发过
+        logger.info("已缓存 bot 群消息 (群 %s, uid=%s): %.50s", gid, uid, content)
 
     _OUTBOUND_DEDUP_TTL = 10.0
     """出站消息指纹去重窗口（秒）。覆盖同一条消息被多个钩子先后捕获的时间差。"""
@@ -898,6 +901,13 @@ class RelationshipManager(Star):
             self._outbound_cache_dedup.popleft()
         for existing, ts in self._outbound_cache_dedup:
             if existing == key and now - ts <= self._OUTBOUND_DEDUP_TTL:
+                # issue #70：去重压制不能再静默——如果多条钩子捕获正常工作，
+                # 压制只会命中"同一条消息的多路捕获"；若用户反馈 bot 发言缺失，
+                # 这条 INFO 日志能区分"去重误吞真实重复发言"还是"钩子根本没触发"
+                logger.info(
+                    "出站消息指纹在 %s 秒内已缓存过，跳过重复缓存 (群 %s): %.50s",
+                    self._OUTBOUND_DEDUP_TTL, group_id, body,
+                )
                 return False
         self._outbound_cache_dedup.append((key, now))
         return True
