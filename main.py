@@ -21,8 +21,9 @@ PLUGIN_VERSION = "5.2.15"
 # issue #81：私聊失败的好友关系特征。只认协议端 wording 里"明确判定为非好友"
 # 的表述，不收录"好友关系"这类宽泛说法——"好友关系异常"等其他故障会被误
 # 分类成"非好友"并隐藏掉（PR #82 审查：over-broad-error-classification）。
+# 覆盖协议端常见表述：非好友 / 不是(你的/我的)好友 / 好友不存在 / not (a|your) friend。
 NOT_FRIEND_HINT = re.compile(
-    r"非好友|不是好友|not\s+(?:an?\s+)?friend",
+    r"非好友|不是[^，。；\s]{0,3}好友|好友不存在|not\s+(?:a\s+|your\s+)?friend",
     re.IGNORECASE,
 )
 
@@ -424,6 +425,22 @@ class RelationshipManager(Star):
                 parts.append(f"wording={wording}")
             return ", ".join(parts) if parts else str(res)
         return str(res)
+
+    @staticmethod
+    def _not_friend_wording(res: Any) -> str:
+        """取协议端返回里用于好友关系判定的措辞（只看 wording/message）。"""
+        if isinstance(res, dict):
+            return str(res.get("wording") or res.get("message") or "")
+        return ""
+
+    def _is_not_friend_response(self, res: Any) -> bool:
+        """响应是否明确表示「非好友/已失效」。
+
+        只匹配协议端措辞字段，不扫 status/retcode 等结构化字段——避免真实
+        故障被误分类后从失败列表里消失（PR #82 审查）。
+        """
+        wording = self._not_friend_wording(res)
+        return bool(wording) and bool(NOT_FRIEND_HINT.search(wording))
 
     async def _notify(self, msg: str):
         """修复7: 委托给 _notify_with_ids，忽略返回值"""
@@ -2949,6 +2966,9 @@ class RelationshipManager(Star):
                 except Exception as e:
                     last_res = None
                     last_exc = str(e)
+                # 非好友/已失效属确定性错误，重试不会恢复，直接结束该目标的重试。
+                if self._is_not_friend_response(last_res):
+                    break
                 await asyncio.sleep(0.3)
             if sent:
                 ok_friends.append(fid)
@@ -2959,10 +2979,7 @@ class RelationshipManager(Star):
             # wording 字段里做好友关系匹配，不扫整个失败文本（status/retcode
             # 等结构化字段可能碰巧包含关键词）；匹配不上的一律保留在失败列表，
             # 宁可展示为失败也不冒充"非好友"隐藏真实故障。
-            wording = ""
-            if isinstance(last_res, dict):
-                wording = str(last_res.get("wording") or last_res.get("message") or "")
-            if wording and NOT_FRIEND_HINT.search(wording):
+            if self._is_not_friend_response(last_res):
                 not_friend_friends.append(fid)
             else:
                 fail_friends.append(fid)
