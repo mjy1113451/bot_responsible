@@ -18,11 +18,11 @@ from astrbot.api import logger
 # 升级时只改这里和 metadata.yaml 两处，避免日志/横幅等处出现版本号副本。
 PLUGIN_VERSION = "5.2.14"
 
-# issue #81：私聊失败错误文本的好友关系特征。协议端对非好友/已删除好友的
-# send_private_msg 通常携带这类措辞，据此把「目标本身不可达」与真实广播
-# 失败分开汇报，避免管理员误以为公告发送出了问题。
+# issue #81：私聊失败的好友关系特征。仅匹配协议端 wording 里的明确表述，
+# 不用"已删除/关系异常"这类通用词——失败文本偶含这些词时会把真实故障
+# 误分类成"非好友"并隐藏掉（PR #82 审查：over-broad-error-classification）。
 NOT_FRIEND_HINT = re.compile(
-    r"非好友|不是好友|好友关系|陌生人|not\s*friend|关系异常|已经删除|已删除",
+    r"非好友|不是好友|好友关系|not\s*friend",
     re.IGNORECASE,
 )
 
@@ -2899,6 +2899,7 @@ class RelationshipManager(Star):
             if gid in excluded:
                 continue
             sent = False
+            last_err = ""
             for _ in range(3):
                 try:
                     # cache_history=False：公告是批量主动发送，不应写入各群的
@@ -2909,9 +2910,14 @@ class RelationshipManager(Star):
                     if self._api_ok(res):
                         sent = True
                         break
-                except Exception:
-                    pass
+                    last_err = self._api_failure_text(res)
+                except Exception as e:
+                    last_err = str(e)
                 await asyncio.sleep(0.3)
+            # PR #82 审查（missing-error-handling）：群发送失败不再静默——
+            # 落日志带群号与失败原因，便于区分不在群/被禁言/限流等故障
+            if not sent:
+                logger.warning(f"公告广播：向群 {gid} 发送失败: {last_err or '无失败详情'}")
             (ok_groups if sent else fail_groups).append(gid)
 
         friends = await self._api("get_friend_list", event=event)
@@ -2930,7 +2936,8 @@ class RelationshipManager(Star):
             if not fid:
                 continue
             sent = False
-            last_err = ""
+            last_res: Any = None
+            last_exc = ""
             for _ in range(3):
                 try:
                     res = await self._api("send_private_msg", event=event,
@@ -2938,15 +2945,24 @@ class RelationshipManager(Star):
                     if self._api_ok(res):
                         sent = True
                         break
-                    last_err = self._api_failure_text(res)
+                    last_res = res
                 except Exception as e:
-                    last_err = str(e)
+                    last_res = None
+                    last_exc = str(e)
                 await asyncio.sleep(0.3)
             if sent:
                 ok_friends.append(fid)
                 continue
-            logger.warning(f"公告广播：向好友 {fid} 私聊失败: {last_err or '无失败详情'}")
-            if last_err and NOT_FRIEND_HINT.search(last_err):
+            detail = self._api_failure_text(last_res) if last_res is not None else last_exc
+            logger.warning(f"公告广播：向好友 {fid} 私聊失败: {detail or '无失败详情'}")
+            # PR #82 审查（over-broad-error-classification）：只在协议端返回的
+            # wording 字段里做好友关系匹配，不扫整个失败文本（status/retcode
+            # 等结构化字段可能碰巧包含关键词）；匹配不上的一律保留在失败列表，
+            # 宁可展示为失败也不冒充"非好友"隐藏真实故障。
+            wording = ""
+            if isinstance(last_res, dict):
+                wording = str(last_res.get("wording") or last_res.get("message") or "")
+            if wording and NOT_FRIEND_HINT.search(wording):
                 not_friend_friends.append(fid)
             else:
                 fail_friends.append(fid)
