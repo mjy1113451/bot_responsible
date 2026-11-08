@@ -16,13 +16,13 @@ from astrbot.api import logger
 
 # 插件版本的代码侧唯一来源，必须与 metadata.yaml 的 version 保持一致。
 # 升级时只改这里和 metadata.yaml 两处，避免日志/横幅等处出现版本号副本。
-PLUGIN_VERSION = "5.2.14"
+PLUGIN_VERSION = "5.2.15"
 
-# issue #81：私聊失败的好友关系特征。仅匹配协议端 wording 里的明确表述，
-# 不用"已删除/关系异常"这类通用词——失败文本偶含这些词时会把真实故障
-# 误分类成"非好友"并隐藏掉（PR #82 审查：over-broad-error-classification）。
+# issue #81：私聊失败的好友关系特征。只认协议端 wording 里"明确判定为非好友"
+# 的表述，不收录"好友关系"这类宽泛说法——"好友关系异常"等其他故障会被误
+# 分类成"非好友"并隐藏掉（PR #82 审查：over-broad-error-classification）。
 NOT_FRIEND_HINT = re.compile(
-    r"非好友|不是好友|好友关系|not\s*friend",
+    r"非好友|不是好友|not\s+(?:an?\s+)?friend",
     re.IGNORECASE,
 )
 
