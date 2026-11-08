@@ -86,6 +86,8 @@ git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relat
 | `/拉黑请求` | `/blockreply` | 拒绝并拉黑请求；支持引用通知或 `/拉黑请求 编号` | 管理员 |
 | `/通知群` | `/setnotify`, `/setgroup` | 设置通知群 | 管理员 |
 | `/抽查` | `/spotcheck` | 转发指定用户或群的最近 N 条聊天记录给 Bot 主 | 管理员 |
+| `/黑名单群号` | `/bgg`, `/群黑名单` | 查看/增删 LLM 恢复黑名单群（在名单中的群即使开启 LLM 恢复也不回复） | 管理员 |
+| `/gg` | `/公告`, `/broadcast` | 向全部群与好友广播公告（自动排除广播排除群与黑名单群） | 管理员 |
 
 ### 使用示例
 
@@ -149,6 +151,8 @@ git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relat
 | `notify_group` | string | `None` | 通知群号（为空则私聊通知） |
 | `notify_qq` | list[string] | `[]` | 额外接收通知的 QQ 号列表 |
 | `ban_forward_history_count` | int | `20` | Bot 被群禁言时，合并转发禁言前最近 N 条群聊记录；设为 `0` 关闭，最大 `100` |
+| `blacklist_groups` | list[string] | `[]` | LLM 恢复黑名单群：在名单中的群，即使 AstrBot 开启内置 LLM 恢复也不回复；同时不参与 `gg` 公告广播。可用 `/黑名单群号` 管理 |
+| `broadcast_exclude_groups` | list[string] | `[]` | 公告广播排除群：`gg` 公告广播时跳过这些群 |
 
 ## 🔧 工作原理
 
@@ -182,6 +186,10 @@ git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relat
 ## 🐛 已知问题
 
 - `/加好友`、`/加群` 不是 OneBot v11 标准 action。SnowLuma 提供 `send_packet`，但这里的主动添加逻辑仍属于原始包实验路径，可能因 QQ/SnowLuma 版本变化失效。
+- 禁言转发/抽查中缺失 bot 自己的发言（#70，needs-info）时，可按以下顺序排查：
+  1. 确认 `ban_forward_history_count > 0`（为 0 时缓存整体关闭）；
+  2. 日志中搜「已缓存 bot 群消息」——没有说明出站缓存钩子未触发（多为 self_id 解析失败，搜「缓存 bot 自身群消息跳过」）；
+  3. 日志中搜「跳过重复缓存」——10 秒去重窗口内同内容的多次发言只会缓存一条。
 
 ## 🤝 贡献
 

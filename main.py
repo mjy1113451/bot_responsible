@@ -16,7 +16,16 @@ from astrbot.api import logger
 
 # 插件版本的代码侧唯一来源，必须与 metadata.yaml 的 version 保持一致。
 # 升级时只改这里和 metadata.yaml 两处，避免日志/横幅等处出现版本号副本。
-PLUGIN_VERSION = "5.2.14"
+PLUGIN_VERSION = "5.2.15"
+
+# issue #81：私聊失败的好友关系特征。只认协议端 wording 里"明确判定为非好友"
+# 的表述，不收录"好友关系"这类宽泛说法——"好友关系异常"等其他故障会被误
+# 分类成"非好友"并隐藏掉（PR #82 审查：over-broad-error-classification）。
+# 覆盖协议端常见表述：非好友 / 不是(你的/我的)好友 / 好友不存在 / not (a|your) friend。
+NOT_FRIEND_HINT = re.compile(
+    r"非好友|不是[^，。；\s]{0,3}好友|好友不存在|not\s+(?:a\s+|your\s+)?friend",
+    re.IGNORECASE,
+)
 
 # 尝试导入 AiocqhttpMessageEvent（用于类型提示）
 try:
@@ -325,11 +334,17 @@ class RelationshipManager(Star):
                 )
             self._save(self.bl_file, self.blacklist)
 
-    async def _api(self, name: str, event: AstrMessageEvent = None, **kw) -> Any:
-        """调用 OneBot API"""
+    async def _api(self, name: str, event: AstrMessageEvent = None,
+                   cache_history: bool = True, **kw) -> Any:
+        """调用 OneBot API
+
+        cache_history=False 时，send_group_msg 不再把消息写入禁言转发历史。
+        PR #78 审查反馈：gg 全量公告等批量主动发送会污染每个群的禁言复盘
+        上下文（占用有限缓存并混入无关内容），此类发送路径应显式跳过缓存；
+        正常对话响应及禁言前需要复盘的发送路径保持默认缓存。"""
         # issue #56: bot 自己发群消息时，缓存到禁言转发上下文，
         # 这样禁言后合并转发能看到 bot 自己的发言，便于 bot 主复盘禁言原因。
-        if name == "send_group_msg":
+        if name == "send_group_msg" and cache_history:
             try:
                 gid = kw.get("group_id")
                 if gid is not None:
@@ -410,6 +425,22 @@ class RelationshipManager(Star):
                 parts.append(f"wording={wording}")
             return ", ".join(parts) if parts else str(res)
         return str(res)
+
+    @staticmethod
+    def _not_friend_wording(res: Any) -> str:
+        """取协议端返回里用于好友关系判定的措辞（只看 wording/message）。"""
+        if isinstance(res, dict):
+            return str(res.get("wording") or res.get("message") or "")
+        return ""
+
+    def _is_not_friend_response(self, res: Any) -> bool:
+        """响应是否明确表示「非好友/已失效」。
+
+        只匹配协议端措辞字段，不扫 status/retcode 等结构化字段——避免真实
+        故障被误分类后从失败列表里消失（PR #82 审查）。
+        """
+        wording = self._not_friend_wording(res)
+        return bool(wording) and bool(NOT_FRIEND_HINT.search(wording))
 
     async def _notify(self, msg: str):
         """修复7: 委托给 _notify_with_ids，忽略返回值"""
@@ -865,6 +896,9 @@ class RelationshipManager(Star):
             "name": str(self_nickname or self._self_nickname or "bot"),
             "content": content,
         })
+        # issue #70：bot 自身发言缓存成功也落一条日志（截断防刷屏），
+        # bot 发言在禁言转发/抽查中缺失时，可以从日志确认缓存钩子是否触发过
+        logger.info("已缓存 bot 群消息 (群 %s, uid=%s): %.50s", gid, uid, content)
 
     _OUTBOUND_DEDUP_TTL = 10.0
     """出站消息指纹去重窗口（秒）。覆盖同一条消息被多个钩子先后捕获的时间差。"""
@@ -892,6 +926,13 @@ class RelationshipManager(Star):
             self._outbound_cache_dedup.popleft()
         for existing, ts in self._outbound_cache_dedup:
             if existing == key and now - ts <= self._OUTBOUND_DEDUP_TTL:
+                # issue #70：去重压制不能再静默——如果多条钩子捕获正常工作，
+                # 压制只会命中"同一条消息的多路捕获"；若用户反馈 bot 发言缺失，
+                # 这条 INFO 日志能区分"去重误吞真实重复发言"还是"钩子根本没触发"
+                logger.info(
+                    "出站消息指纹在 %s 秒内已缓存过，跳过重复缓存 (群 %s): %.50s",
+                    self._OUTBOUND_DEDUP_TTL, group_id, body,
+                )
                 return False
         self._outbound_cache_dedup.append((key, now))
         return True
@@ -2192,14 +2233,21 @@ class RelationshipManager(Star):
     @filter.event_message_type(EventMessageType.ALL)
     async def handle_event(self, event: AstrMessageEvent) -> Optional[AstrMessageEvent]:
         # issue #74: 命中 LLM 恢复黑名单群时直接丢弃事件，bot 不做任何回复。
+        # PR #78 审查反馈：仅 return None 不能可靠阻止后续内置 LLM 流程，
+        # 需显式 stop_event() 终止事件；拦截检查的异常也不能静默吞掉，
+        # 至少留 warning 日志，避免"黑名单群仍在回复"时无从排查。
         try:
             if event.get_message_type() == MessageType.GROUP_MESSAGE:
                 gid = str(event.get_group_id() or "").strip()
                 if gid and gid in self.blacklist_groups:
                     logger.info(f"群 {gid} 在 LLM 恢复黑名单中，屏蔽本次消息")
+                    try:
+                        event.stop_event()
+                    except Exception as e:
+                        logger.warning(f"群 {gid} 黑名单拦截 stop_event 失败: {e}")
                     return None
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"LLM 恢复黑名单群检查异常: {e}")
 
         try:
             self._cache_group_message(event)
@@ -2825,13 +2873,35 @@ class RelationshipManager(Star):
             yield event.plain_result("⚠️ 用法：gg 公告内容")
             return
 
+        # issue #80：公告发布人显示实际发出指令的管理员，而不是 bot 身份。
+        # 昵称解析失败时回退 QQ 号；两者都拿不到才退 bot（此时无从得知发起人）。
         self_id = await self._resolve_self_id(event) or "bot"
-        text = f"{self_id}发布了公告：\n{content}"
+        sender_id = ""
+        sender_name = ""
+        try:
+            sender_id = str(event.get_sender_id() or "").strip()
+        except Exception:
+            pass
+        try:
+            sender_name = (event.get_sender_name() or "").strip()
+        except Exception:
+            pass
+        if sender_name and sender_id:
+            publisher = f"{sender_name}（{sender_id}）"
+        elif sender_id:
+            publisher = sender_id
+        else:
+            publisher = self_id
+        text = f"{publisher} 发布了公告：\n{content}"
 
         ok_groups: List[str] = []
         fail_groups: List[str] = []
         ok_friends: List[str] = []
         fail_friends: List[str] = []
+        # PR #78 审查反馈：广播目标必须排除 LLM 恢复黑名单群（这些群已声明
+        # "即使开启 LLM 恢复也不回复"，主动发公告同样违背其静默语义），
+        # 与 broadcast_exclude_groups 一起统一收敛到发送循环内判断。
+        excluded = set(self.broadcast_exclude_groups) | set(self.blacklist_groups)
 
         groups = await self._api("get_group_list", event=event)
         group_items = []
@@ -2843,19 +2913,28 @@ class RelationshipManager(Star):
             gid = str(g.get("group_id") or "").strip()
             if not gid:
                 continue
-            if gid in self.broadcast_exclude_groups:
+            if gid in excluded:
                 continue
             sent = False
+            last_err = ""
             for _ in range(3):
                 try:
+                    # cache_history=False：公告是批量主动发送，不应写入各群的
+                    # 禁言转发历史（否则全量公告会污染禁言复盘上下文）
                     res = await self._api("send_group_msg", event=event,
-                                          group_id=int(gid), message=text)
+                                          group_id=int(gid), message=text,
+                                          cache_history=False)
                     if self._api_ok(res):
                         sent = True
                         break
-                except Exception:
-                    pass
+                    last_err = self._api_failure_text(res)
+                except Exception as e:
+                    last_err = str(e)
                 await asyncio.sleep(0.3)
+            # PR #82 审查（missing-error-handling）：群发送失败不再静默——
+            # 落日志带群号与失败原因，便于区分不在群/被禁言/限流等故障
+            if not sent:
+                logger.warning(f"公告广播：向群 {gid} 发送失败: {last_err or '无失败详情'}")
             (ok_groups if sent else fail_groups).append(gid)
 
         friends = await self._api("get_friend_list", event=event)
@@ -2864,11 +2943,18 @@ class RelationshipManager(Star):
             data = self._api_data(friends)
             if isinstance(data, list):
                 friend_items = data
+        # issue #81：好友列表可能混有已失效/非好友的历史记录（协议端不清税），
+        # 逐个硬发只会得到同一类失败。发送失败时保留最后一次的结构化原因并落
+        # 日志，错误文本带好友关系特征的目标单独归类为「非好友/已失效」，
+        # 不再与真实广播失败混在同一个"失败QQ号"列表里。
+        not_friend_friends: List[str] = []
         for f in friend_items:
             fid = str(f.get("user_id") or "").strip()
             if not fid:
                 continue
             sent = False
+            last_res: Any = None
+            last_exc = ""
             for _ in range(3):
                 try:
                     res = await self._api("send_private_msg", event=event,
@@ -2876,18 +2962,41 @@ class RelationshipManager(Star):
                     if self._api_ok(res):
                         sent = True
                         break
-                except Exception:
-                    pass
+                    last_res = res
+                except Exception as e:
+                    last_res = None
+                    last_exc = str(e)
+                # 非好友/已失效属确定性错误，重试不会恢复，直接结束该目标的重试。
+                if self._is_not_friend_response(last_res):
+                    break
                 await asyncio.sleep(0.3)
-            (ok_friends if sent else fail_friends).append(fid)
+            if sent:
+                ok_friends.append(fid)
+                continue
+            detail = self._api_failure_text(last_res) if last_res is not None else last_exc
+            logger.warning(f"公告广播：向好友 {fid} 私聊失败: {detail or '无失败详情'}")
+            # PR #82 审查（over-broad-error-classification）：只在协议端返回的
+            # wording 字段里做好友关系匹配，不扫整个失败文本（status/retcode
+            # 等结构化字段可能碰巧包含关键词）；匹配不上的一律保留在失败列表，
+            # 宁可展示为失败也不冒充"非好友"隐藏真实故障。
+            if self._is_not_friend_response(last_res):
+                not_friend_friends.append(fid)
+            else:
+                fail_friends.append(fid)
 
         lines = [f"📢 公告已发送：\n{content}", ""]
         lines.append(f"群：成功 {len(ok_groups)}，失败 {len(fail_groups)}")
         if fail_groups:
             lines.append("失败群号：" + ", ".join(fail_groups))
-        lines.append(f"好友：成功 {len(ok_friends)}，失败 {len(fail_friends)}")
+        summary = f"好友：成功 {len(ok_friends)}，失败 {len(fail_friends)}"
+        if not_friend_friends:
+            summary += f"，非好友/已失效 {len(not_friend_friends)}"
+        lines.append(summary)
         if fail_friends:
             lines.append("失败QQ号：" + ", ".join(fail_friends))
+        if not_friend_friends:
+            lines.append("非好友/已失效（协议端好友列表含已失效记录，未计入失败）："
+                         + ", ".join(not_friend_friends))
         yield event.plain_result("\n".join(lines))
 
     # ───────── 待处理 ─────────
