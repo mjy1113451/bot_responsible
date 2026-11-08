@@ -18,6 +18,14 @@ from astrbot.api import logger
 # 升级时只改这里和 metadata.yaml 两处，避免日志/横幅等处出现版本号副本。
 PLUGIN_VERSION = "5.2.14"
 
+# issue #81：私聊失败错误文本的好友关系特征。协议端对非好友/已删除好友的
+# send_private_msg 通常携带这类措辞，据此把「目标本身不可达」与真实广播
+# 失败分开汇报，避免管理员误以为公告发送出了问题。
+NOT_FRIEND_HINT = re.compile(
+    r"非好友|不是好友|好友关系|陌生人|not\s*friend|关系异常|已经删除|已删除",
+    re.IGNORECASE,
+)
+
 # 尝试导入 AiocqhttpMessageEvent（用于类型提示）
 try:
     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
@@ -2848,8 +2856,26 @@ class RelationshipManager(Star):
             yield event.plain_result("⚠️ 用法：gg 公告内容")
             return
 
+        # issue #80：公告发布人显示实际发出指令的管理员，而不是 bot 身份。
+        # 昵称解析失败时回退 QQ 号；两者都拿不到才退 bot（此时无从得知发起人）。
         self_id = await self._resolve_self_id(event) or "bot"
-        text = f"{self_id}发布了公告：\n{content}"
+        sender_id = ""
+        sender_name = ""
+        try:
+            sender_id = str(event.get_sender_id() or "").strip()
+        except Exception:
+            pass
+        try:
+            sender_name = (event.get_sender_name() or "").strip()
+        except Exception:
+            pass
+        if sender_name and sender_id:
+            publisher = f"{sender_name}（{sender_id}）"
+        elif sender_id:
+            publisher = sender_id
+        else:
+            publisher = self_id
+        text = f"{publisher} 发布了公告：\n{content}"
 
         ok_groups: List[str] = []
         fail_groups: List[str] = []
@@ -2894,11 +2920,17 @@ class RelationshipManager(Star):
             data = self._api_data(friends)
             if isinstance(data, list):
                 friend_items = data
+        # issue #81：好友列表可能混有已失效/非好友的历史记录（协议端不清税），
+        # 逐个硬发只会得到同一类失败。发送失败时保留最后一次的结构化原因并落
+        # 日志，错误文本带好友关系特征的目标单独归类为「非好友/已失效」，
+        # 不再与真实广播失败混在同一个"失败QQ号"列表里。
+        not_friend_friends: List[str] = []
         for f in friend_items:
             fid = str(f.get("user_id") or "").strip()
             if not fid:
                 continue
             sent = False
+            last_err = ""
             for _ in range(3):
                 try:
                     res = await self._api("send_private_msg", event=event,
@@ -2906,18 +2938,32 @@ class RelationshipManager(Star):
                     if self._api_ok(res):
                         sent = True
                         break
-                except Exception:
-                    pass
+                    last_err = self._api_failure_text(res)
+                except Exception as e:
+                    last_err = str(e)
                 await asyncio.sleep(0.3)
-            (ok_friends if sent else fail_friends).append(fid)
+            if sent:
+                ok_friends.append(fid)
+                continue
+            logger.warning(f"公告广播：向好友 {fid} 私聊失败: {last_err or '无失败详情'}")
+            if last_err and NOT_FRIEND_HINT.search(last_err):
+                not_friend_friends.append(fid)
+            else:
+                fail_friends.append(fid)
 
         lines = [f"📢 公告已发送：\n{content}", ""]
         lines.append(f"群：成功 {len(ok_groups)}，失败 {len(fail_groups)}")
         if fail_groups:
             lines.append("失败群号：" + ", ".join(fail_groups))
-        lines.append(f"好友：成功 {len(ok_friends)}，失败 {len(fail_friends)}")
+        summary = f"好友：成功 {len(ok_friends)}，失败 {len(fail_friends)}"
+        if not_friend_friends:
+            summary += f"，非好友/已失效 {len(not_friend_friends)}"
+        lines.append(summary)
         if fail_friends:
             lines.append("失败QQ号：" + ", ".join(fail_friends))
+        if not_friend_friends:
+            lines.append("非好友/已失效（协议端好友列表含已失效记录，未计入失败）："
+                         + ", ".join(not_friend_friends))
         yield event.plain_result("\n".join(lines))
 
     # ───────── 待处理 ─────────
