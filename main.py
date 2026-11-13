@@ -1,4 +1,7 @@
 ﻿import json
+import os
+import shutil
+import tempfile
 import re
 import asyncio
 import time
@@ -70,10 +73,13 @@ class RelationshipManager(Star):
         super().__init__(context)
 
         config = self.context.get_config()
-        self.data_dir = Path(
-            config.get("data_path", "data")
-        ) / "plugins" / "astrbot_plugin_relationship_manager"
+        data_root = Path(config.get("data_path", "data"))
+        self.data_dir = data_root / "plugin_data" / "astrbot_plugin_relationship_manager"
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_persistence_directory(
+            data_root / "plugins" / "astrbot_plugin_relationship_manager",
+            self.data_dir,
+        )
 
         self.bl_file = self.data_dir / "blacklist.json"
         self.pd_file = self.data_dir / "pending.json"
@@ -149,6 +155,37 @@ class RelationshipManager(Star):
         )
 
     # ───────── 持久化 ─────────
+
+    @staticmethod
+    def _migrate_persistence_directory(legacy_dir: Path, data_dir: Path):
+        """Copy legacy files once, without overwriting or exposing partial copies."""
+        for name in ("blacklist.json", "pending.json"):
+            source, destination = legacy_dir / name, data_dir / name
+            if os.path.lexists(destination):
+                continue
+            temporary = None
+            try:
+                try:
+                    legacy_file = source.open("rb")
+                except FileNotFoundError:
+                    continue
+                with legacy_file:
+                    with tempfile.NamedTemporaryFile(dir=data_dir, prefix=".migration-", delete=False) as target:
+                        temporary = Path(target.name)
+                        shutil.copyfileobj(legacy_file, target)
+                try:
+                    # A hard link publishes the complete file atomically and never
+                    # overwrites a destination created by another process.
+                    os.link(temporary, destination)
+                except FileExistsError:
+                    continue
+                logger.info("已迁移持久化数据 %s -> %s", source, destination)
+            except Exception as exc:
+                logger.error("迁移持久化数据失败: %s -> %s: %s", source, destination, exc)
+                raise
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _patch_astrbot_message_session_id():
