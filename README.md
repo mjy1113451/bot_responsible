@@ -183,6 +183,8 @@ git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relat
 - `blacklist.json` - 黑名单数据
 - `pending.json` - 待处理请求数据
 
+文件位于 `<data_path>/plugin_data/astrbot_plugin_relationship_manager/`（默认 `data/plugin_data/astrbot_plugin_relationship_manager/`）。升级时，插件会逐个检查旧目录 `<data_path>/plugins/astrbot_plugin_relationship_manager/` 中的这两个文件；仅当新目录中对应文件不存在时复制，已有新文件不会被覆盖，旧文件也会保留。迁移失败会阻止插件初始化，请检查日志和目录权限后重试；新目录需要支持硬链接以安全发布完整的迁移文件。
+
 ## 🐛 已知问题
 
 - `/加好友`、`/加群` 不是 OneBot v11 标准 action。SnowLuma 提供 `send_packet`，但这里的主动添加逻辑仍属于原始包实验路径，可能因 QQ/SnowLuma 版本变化失效。

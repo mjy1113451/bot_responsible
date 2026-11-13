@@ -1,15 +1,9 @@
 """
 扩展功能模块 - Packet 级别协议
-此模块已混淆，仅供内部使用
 """
-import base64
 import json as _json
 import struct as _struct
 from collections import defaultdict as _dd
-
-
-def _d(s):
-    return base64.b64decode(s).decode()
 
 
 class _PT:
@@ -177,11 +171,18 @@ class ExpansionHandle:
         p = {
             "1": 4588, "2": 1,
             "4": {"1": target_gid, "2": {"1": 3, "2": "", "3": answer,
-                "4": _d("PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPgo8bW1nIHRlbXBsYXRlSUQ9IjEiIGJyaWVmPSIiIHNlcnZpY2VJRD0iMTA0Ij4KICAgIDxpdGVtIGxheW91dD0iMiI+CiAgICAgICAgPHBpY3R1cmUgY292ZXI9IiIvPgogICAgICAgIDx0aXRsZT7lvZPog4Hls748L3RpdGxlPgogICAgPC9pdGVtPgogICAgPHNvdXJjZS8+CjwvbW1nPgo="),
+                "4": ('<?xml version="1.0" encoding="utf-8"?>\n'
+                      '<mmg templateID="1" brief="" serviceID="104">\n'
+                      '    <item layout="2">\n'
+                      '        <picture cover=""/>\n'
+                      '        <title>当胁峾</title>\n'
+                      '    </item>\n'
+                      '    <source/>\n'
+                      '</mmg>\n'),
                 "6": {}, "7": {}, "8": {"2": 2}}},
             "12": 1}
         data = _PT.j2h(_json.dumps(p, ensure_ascii=False))
-        await client.api.call_action("send_packet", cmd=_d("T2lkYlN2Y1RycGNUY3AuMHgxMWVjXzE="), data=data)
+        await client.api.call_action("send_packet", cmd="OidbSvcTrpcTcp.0x11ec_1", data=data)
         lines = ["【加群申请】已发送", f"群号：{target_gid}"]
         try:
             info = await client.get_group_info(group_id=target_gid, no_cache=True)
@@ -205,7 +206,7 @@ class ExpansionHandle:
                   "26": answer, "28": 1, "29": 1},
             "12": 1}
         data = _PT.j2h(_json.dumps(p, ensure_ascii=False))
-        await client.api.call_action("send_packet", cmd=_d("T2lkYlN2Y1RycGNUY3AuMHg3YzJfNQ=="), data=data)
+        await client.api.call_action("send_packet", cmd="OidbSvcTrpcTcp.0x7c2_5", data=data)
         lines = ["【好友申请】已发送", f"Q号：{target_uin}"]
         try:
             info = await client.get_stranger_info(user_id=target_uin, no_cache=True)
@@ -244,7 +245,7 @@ class ExpansionHandle:
         try:
             await client.api.call_action(
                 "send_packet",
-                cmd=_d("T2lkYlN2Y1RycGNUY3AuMHhmZDhfMQ=="),
+                cmd="OidbSvcTrpcTcp.0xfd8_1",
                 data=data,
             )
             return True

@@ -4,9 +4,11 @@
 """
 
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -131,6 +133,77 @@ class NotFriendClassificationTests(unittest.TestCase):
         )
         self.assertFalse(is_not_friend(None))
         self.assertFalse(is_not_friend("对方非好友"))
+
+
+class PersistenceMigrationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.legacy = self.root / "plugins" / "astrbot_plugin_relationship_manager"
+        self.dest = self.root / "plugin_data" / "astrbot_plugin_relationship_manager"
+        self.legacy.mkdir(parents=True)
+
+    def initialize(self):
+        context = types.SimpleNamespace(get_config=lambda: {"data_path": str(self.root)})
+        return plugin.RelationshipManager(context)
+
+    def test_initialization_migrates_and_loads_both_files(self):
+        (self.legacy / "blacklist.json").write_text('{"123": {"reason": "test"}}', encoding="utf-8")
+        (self.legacy / "pending.json").write_text('{}', encoding="utf-8")
+        with mock.patch.object(plugin.RelationshipManager, "_migrate_blacklist"):
+            instance = self.initialize()
+        self.assertEqual(instance.data_dir, self.dest)
+        self.assertIn("123", instance.blacklist)
+        for name in ("blacklist.json", "pending.json"):
+            self.assertEqual((self.dest / name).read_bytes(), (self.legacy / name).read_bytes())
+
+    def test_existing_destination_wins_per_file_and_restarts_are_safe(self):
+        self.dest.mkdir(parents=True)
+        (self.legacy / "blacklist.json").write_text('{"legacy": {}}', encoding="utf-8")
+        (self.legacy / "pending.json").write_text('{}', encoding="utf-8")
+        (self.dest / "blacklist.json").write_text('{"current": {}}', encoding="utf-8")
+        for _ in range(2):
+            instance = self.initialize()
+            self.assertIn("current", instance.blacklist)
+            self.assertNotIn("legacy", instance.blacklist)
+        self.assertEqual((self.legacy / "blacklist.json").read_text(encoding="utf-8"), '{"legacy": {}}')
+        self.assertTrue((self.dest / "pending.json").exists())
+
+    def test_fresh_install(self):
+        instance = self.initialize()
+        self.assertEqual(instance.blacklist, {})
+        self.assertEqual(instance.pending, {})
+        self.assertFalse((self.dest / "blacklist.json").exists())
+
+    def test_copy_failure_aborts_and_removes_partial_file_then_retries(self):
+        source = self.legacy / "blacklist.json"
+        source.write_text('{"123": {}}', encoding="utf-8")
+
+        def fail_after_write(src, dst):
+            dst.write(b"partial")
+            raise OSError("copy failed")
+
+        with mock.patch.object(plugin.shutil, "copyfileobj", side_effect=fail_after_write):
+            with self.assertRaisesRegex(OSError, "copy failed"):
+                self.initialize()
+        self.assertEqual(list(self.dest.iterdir()), [])
+        self.assertTrue(source.exists())
+        self.assertIn("123", self.initialize().blacklist)
+
+    def test_destination_created_during_copy_is_not_overwritten(self):
+        (self.legacy / "blacklist.json").write_text('{"legacy": {}}', encoding="utf-8")
+        self.dest.mkdir(parents=True)
+        original_link = plugin.os.link
+
+        def race(src, dst):
+            Path(dst).write_text('{"current": {}}', encoding="utf-8")
+            return original_link(src, dst)
+
+        with mock.patch.object(plugin.os, "link", side_effect=race):
+            instance = self.initialize()
+        self.assertIn("current", instance.blacklist)
+        self.assertEqual(sorted(p.name for p in self.dest.iterdir()), ["blacklist.json"])
 
 
 if __name__ == "__main__":
