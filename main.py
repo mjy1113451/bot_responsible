@@ -19,7 +19,7 @@ from astrbot.api import logger
 
 # 插件版本的代码侧唯一来源，必须与 metadata.yaml 的 version 保持一致。
 # 升级时只改这里和 metadata.yaml 两处，避免日志/横幅等处出现版本号副本。
-PLUGIN_VERSION = "5.2.15"
+PLUGIN_VERSION = "5.2.16"
 
 # issue #81：私聊失败的好友关系特征。只认协议端 wording 里"明确判定为非好友"
 # 的表述，不收录"好友关系"这类宽泛说法——"好友关系异常"等其他故障会被误
