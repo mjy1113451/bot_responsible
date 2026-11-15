@@ -5,6 +5,65 @@ import json as _json
 import struct as _struct
 from collections import defaultdict as _dd
 
+from astrbot.api import logger
+
+
+# Only fields whose role is known are named; other numeric fields remain opaque.
+_COMMAND = "1"
+_SUBCOMMAND = "2"
+_BODY = "4"
+_ENVELOPE_FIELD_12 = "12"  # Meaning not established.
+_GROUP_ID = "1"
+_GROUP_REQUEST = "2"
+_GROUP_ANSWER = "3"
+_GROUP_XML = "4"
+_FRIEND_SELF_ID = "1"
+_FRIEND_TARGET_UIN = "2"
+_FRIEND_VERIFY = "7"
+_FRIEND_REMARK = "18"
+_FRIEND_ANSWER = "26"
+_REMARK_TARGET_UIN = "1"
+_REMARK_CONTAINER = "5"
+_REMARK_TEXT = "1"
+
+GROUP_VERIFICATION_XML = (
+    '<?xml version="1.0" encoding="utf-8"?>\n'
+    '<mmg templateID="1" brief="" serviceID="104">\n'
+    '    <item layout="2">\n'
+    '        <picture cover=""/>\n'
+    '        <title>当胁峾</title>\n'
+    '    </item>\n'
+    '    <source/>\n'
+    '</mmg>\n'
+)
+
+
+def _envelope(command, subcommand, body):
+    return {_COMMAND: command, _SUBCOMMAND: subcommand, _BODY: body,
+            _ENVELOPE_FIELD_12: 1}
+
+
+def _group_packet(target_gid, answer):
+    request = {"1": 3, "2": "", _GROUP_ANSWER: answer,
+               _GROUP_XML: GROUP_VERIFICATION_XML,
+               "6": {}, "7": {}, "8": {"2": 2}}
+    return _envelope(4588, 1, {_GROUP_ID: target_gid, _GROUP_REQUEST: request})
+
+
+def _friend_packet(target_uin, self_id, verify, remark, answer):
+    return _envelope(1986, 5, {
+        _FRIEND_SELF_ID: self_id, _FRIEND_TARGET_UIN: target_uin,
+        "3": 1, "4": 1, "5": 0, _FRIEND_VERIFY: verify,
+        "11": 1, "12": 3, _FRIEND_REMARK: remark, "20": 0,
+        _FRIEND_ANSWER: answer, "28": 1, "29": 1,
+    })
+
+
+def _remark_packet(target_uin, remark):
+    return _envelope(0xfd8, 1, {
+        _REMARK_TARGET_UIN: target_uin, _REMARK_CONTAINER: {_REMARK_TEXT: remark},
+    })
+
 
 class _PT:
     @staticmethod
@@ -17,6 +76,7 @@ class _PT:
             d.from_bytes(p)
             return _json.dumps(d.to_json(), indent=4, ensure_ascii=False)
         except Exception as e:
+            logger.warning(f"Packet hex decoding failed: {e}")
             return _json.dumps({"error": str(e)})
 
     @staticmethod
@@ -27,6 +87,7 @@ class _PT:
             d.from_json(o)
             return d.to_bytes().hex().upper()
         except Exception as e:
+            logger.warning(f"Packet JSON encoding failed: {e}")
             return f"Error: {e}"
 
 
@@ -55,7 +116,7 @@ class _FD:
                 h = v[5:]
                 try:
                     self.v[k].append(bytes.fromhex(h))
-                except:
+                except ValueError:
                     self.v[k].append(v)
             else:
                 self.v[k].append(v)
@@ -103,13 +164,13 @@ class _FD:
                     if not sub.v and len(sb) > 0:
                         raise ValueError()
                     self.v[fn].append(sub)
-                except:
+                except (IndexError, ValueError, _struct.error):
                     try:
                         d = sb.decode("utf-8")
                         if any(ord(c) < 32 and c not in "\n\r\t" for c in d):
                             raise ValueError()
                         self.v[fn].append(d)
-                    except:
+                    except (UnicodeDecodeError, ValueError):
                         self.v[fn].append("hex->" + sb.hex().upper())
             else:
                 return
@@ -168,19 +229,7 @@ class _FD:
 class ExpansionHandle:
     @staticmethod
     async def add_group(client, target_gid, answer):
-        p = {
-            "1": 4588, "2": 1,
-            "4": {"1": target_gid, "2": {"1": 3, "2": "", "3": answer,
-                "4": ('<?xml version="1.0" encoding="utf-8"?>\n'
-                      '<mmg templateID="1" brief="" serviceID="104">\n'
-                      '    <item layout="2">\n'
-                      '        <picture cover=""/>\n'
-                      '        <title>当胁峾</title>\n'
-                      '    </item>\n'
-                      '    <source/>\n'
-                      '</mmg>\n'),
-                "6": {}, "7": {}, "8": {"2": 2}}},
-            "12": 1}
+        p = _group_packet(target_gid, answer)
         data = _PT.j2h(_json.dumps(p, ensure_ascii=False))
         await client.api.call_action("send_packet", cmd="OidbSvcTrpcTcp.0x11ec_1", data=data)
         lines = ["【加群申请】已发送", f"群号：{target_gid}"]
@@ -191,20 +240,15 @@ class ExpansionHandle:
             mc, mm = info.get("member_count"), info.get("max_member_count")
             if mc and mm:
                 lines.append(f"人数：{mc}/{mm}")
-        except:
-            pass
+        except Exception as exc:
+            logger.warning(f"OidbSvcTrpcTcp.0x11ec_1 group info lookup failed for {target_gid}: {exc}")
         if answer:
             lines.append(f"答案：{answer}")
         return "\n".join(lines)
 
     @staticmethod
     async def add_friend(client, target_uin, self_id, verify="", remark="", answer=""):
-        p = {
-            "1": 1986, "2": 5,
-            "4": {"1": self_id, "2": target_uin, "3": 1, "4": 1, "5": 0,
-                  "7": verify, "11": 1, "12": 3, "18": remark, "20": 0,
-                  "26": answer, "28": 1, "29": 1},
-            "12": 1}
+        p = _friend_packet(target_uin, self_id, verify, remark, answer)
         data = _PT.j2h(_json.dumps(p, ensure_ascii=False))
         await client.api.call_action("send_packet", cmd="OidbSvcTrpcTcp.0x7c2_5", data=data)
         lines = ["【好友申请】已发送", f"Q号：{target_uin}"]
@@ -214,8 +258,8 @@ class ExpansionHandle:
                 lines.append(f"昵称：{info['nickname']}")
             if info.get("qqLevel"):
                 lines.append(f"等级：{info['qqLevel']}")
-        except:
-            pass
+        except Exception as exc:
+            logger.warning(f"OidbSvcTrpcTcp.0x7c2_5 stranger info lookup failed for {target_uin}: {exc}")
         if verify:
             lines.append(f"验证消息：{verify}")
         if remark:
@@ -235,12 +279,7 @@ class ExpansionHandle:
         Returns:
             True 表示 send_packet 调用成功,False 表示调用失败。
         """
-        # OidbSvc.0xfd8_1: req.body.remark = 新备注
-        p = {
-            "1": 0xfd8, "2": 1,
-            "4": {"1": target_uin, "5": {"1": remark}},
-            "12": 1,
-        }
+        p = _remark_packet(target_uin, remark)
         data = _PT.j2h(_json.dumps(p, ensure_ascii=False))
         try:
             await client.api.call_action(
@@ -249,5 +288,6 @@ class ExpansionHandle:
                 data=data,
             )
             return True
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"OidbSvcTrpcTcp.0xfd8_1 send failed for {target_uin}: {exc}")
             return False
