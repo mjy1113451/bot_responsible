@@ -1,5 +1,6 @@
 """Regression tests for the send_packet wire payloads."""
 
+import json
 import sys
 import types
 import unittest
@@ -24,6 +25,8 @@ else:
     import pkg
 
 ExpansionHandle = pkg.ExpansionHandle
+_FD = pkg._FD
+_PT = pkg._PT
 
 
 def varint(value):
@@ -43,6 +46,23 @@ def blob(field, value):
     if isinstance(value, str):
         value = value.encode("utf-8")
     return varint((field << 3) | 2) + varint(len(value)) + value
+
+
+class PacketEncodingTests(unittest.TestCase):
+    def test_invalid_json_raises_instead_of_returning_error_text(self):
+        with self.assertRaisesRegex(ValueError, "Packet JSON encoding failed") as caught:
+            _PT.j2h("{")
+        self.assertIsInstance(caught.exception.__cause__, json.JSONDecodeError)
+
+    def test_serializer_failure_preserves_cause(self):
+        failure = RuntimeError("encoding failed")
+        with patch.object(_FD, "to_bytes", side_effect=failure):
+            with self.assertRaisesRegex(ValueError, "Packet JSON encoding failed") as caught:
+                _PT.j2h('{"1": 1}')
+        self.assertIs(caught.exception.__cause__, failure)
+
+    def test_valid_payload_still_returns_hex(self):
+        self.assertEqual(_PT.j2h('{"1": 1}'), "0801")
 
 
 class PacketTests(unittest.IsolatedAsyncioTestCase):
@@ -87,6 +107,35 @@ class PacketTests(unittest.IsolatedAsyncioTestCase):
         self.assert_packet("OidbSvcTrpcTcp.0x7c2_5", expected)
         self.assertIn(f"验证消息：{verify}", result)
 
+    async def test_encoding_failures_never_send_packets(self):
+        operations = (
+            (ExpansionHandle.add_group, (12345, "答案")),
+            (ExpansionHandle.add_friend, (200, 100)),
+            (ExpansionHandle.set_friend_remark, (200, "备注")),
+        )
+        for operation, args in operations:
+            with self.subTest(operation=operation.__name__):
+                with patch.object(_FD, "to_bytes", side_effect=RuntimeError("encoding failed")):
+                    if operation is ExpansionHandle.set_friend_remark:
+                        self.assertFalse(await operation(self.client, *args))
+                    else:
+                        with self.assertRaisesRegex(ValueError, "Packet JSON encoding failed"):
+                            await operation(self.client, *args)
+                self.client.api.call_action.assert_not_called()
+                self.client.get_group_info.assert_not_called()
+                self.client.get_stranger_info.assert_not_called()
+
+    async def test_unencodable_unicode_never_sends_packets(self):
+        invalid_text = "\ud800"
+        with self.assertRaisesRegex(ValueError, "Packet JSON encoding failed"):
+            await ExpansionHandle.add_group(self.client, 12345, invalid_text)
+        with self.assertRaisesRegex(ValueError, "Packet JSON encoding failed"):
+            await ExpansionHandle.add_friend(self.client, 200, 100, verify=invalid_text)
+        self.assertFalse(await ExpansionHandle.set_friend_remark(self.client, 200, invalid_text))
+        self.client.api.call_action.assert_not_called()
+        self.client.get_group_info.assert_not_called()
+        self.client.get_stranger_info.assert_not_called()
+
     async def test_set_friend_remark_packet_and_failure(self):
         remark = "  备注🙂\n"
         expected = (number(1, 0xfd8) + number(2, 1)
@@ -99,6 +148,44 @@ class PacketTests(unittest.IsolatedAsyncioTestCase):
         message = str(logger.warning.call_args)
         for part in ("0xfd8_1", "200", "send failed"):
             self.assertIn(part, message)
+
+    async def test_remark_encoding_failures_log_stage_and_never_send(self):
+        for target, method, failure in (
+            (pkg, "_remark_packet", TypeError("build failed")),
+            (pkg._json, "dumps", TypeError("serialization failed")),
+            (pkg._PT, "j2h", ValueError("encoding failed")),
+        ):
+            with self.subTest(method=method):
+                with patch.object(target, method, side_effect=failure):
+                    with patch.object(pkg, "logger") as logger:
+                        self.assertFalse(await ExpansionHandle.set_friend_remark(
+                            self.client, 200, "private remark"))
+                self.client.api.call_action.assert_not_called()
+                logger.warning.assert_called_once()
+                message = logger.warning.call_args.args[0]
+                for part in ("OidbSvcTrpcTcp.0xfd8_1", "200", "payload encoding failed", str(failure)):
+                    self.assertIn(part, message)
+                self.assertNotIn("send failed", message)
+                self.assertNotIn("private remark", message)
+
+    async def test_remark_real_unicode_encoding_failure_logs_stage(self):
+        with patch.object(pkg, "logger") as logger:
+            self.assertFalse(await ExpansionHandle.set_friend_remark(self.client, 200, "\ud800"))
+        self.client.api.call_action.assert_not_called()
+        message = logger.warning.call_args.args[0]
+        for part in ("OidbSvcTrpcTcp.0xfd8_1", "200", "payload encoding failed", "utf-8"):
+            self.assertIn(part, message)
+
+    async def test_remark_send_failure_has_distinct_log_stage(self):
+        self.client.api.call_action.side_effect = RuntimeError("transport unavailable")
+        with patch.object(pkg, "logger") as logger:
+            self.assertFalse(await ExpansionHandle.set_friend_remark(self.client, 200, "备注"))
+        self.client.api.call_action.assert_awaited_once()
+        logger.warning.assert_called_once()
+        message = logger.warning.call_args.args[0]
+        for part in ("OidbSvcTrpcTcp.0xfd8_1", "200", "send failed", "transport unavailable"):
+            self.assertIn(part, message)
+        self.assertNotIn("payload encoding failed", message)
 
     def test_named_packet_fields_and_empty_values(self):
         group = pkg._group_packet  # Known fields are mapped; opaque fields remain intact.
@@ -129,7 +216,8 @@ class PacketTests(unittest.IsolatedAsyncioTestCase):
     def test_conversion_errors_log_and_preserve_results(self):
         with patch.object(pkg, "logger") as logger:
             self.assertIn('"error"', pkg._PT.h2j("not hex"))
-            self.assertTrue(pkg._PT.j2h("not json").startswith("Error:"))
+            with self.assertRaisesRegex(ValueError, "Packet JSON encoding failed"):
+                pkg._PT.j2h("not json")
         self.assertEqual(logger.warning.call_count, 2)
 
     async def test_add_send_failures_propagate_without_lookup(self):

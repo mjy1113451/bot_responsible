@@ -88,7 +88,7 @@ class _PT:
             return d.to_bytes().hex().upper()
         except Exception as e:
             logger.warning(f"Packet JSON encoding failed: {e}")
-            return f"Error: {e}"
+            raise ValueError(f"Packet JSON encoding failed: {e}") from e
 
 
 class _FD:
@@ -277,10 +277,14 @@ class ExpansionHandle:
         不在标准 OneBot v11 action 范围内,可能因协议变更失效。
 
         Returns:
-            True 表示 send_packet 调用成功,False 表示调用失败。
+            True 表示 send_packet 调用成功,False 表示编码或调用失败。
         """
-        p = _remark_packet(target_uin, remark)
-        data = _PT.j2h(_json.dumps(p, ensure_ascii=False))
+        try:
+            p = _remark_packet(target_uin, remark)
+            data = _PT.j2h(_json.dumps(p, ensure_ascii=False))
+        except Exception as exc:
+            logger.warning(f"OidbSvcTrpcTcp.0xfd8_1 payload encoding failed for {target_uin}: {exc}")
+            return False
         try:
             await client.api.call_action(
                 "send_packet",
