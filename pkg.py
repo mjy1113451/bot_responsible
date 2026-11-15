@@ -27,7 +27,7 @@ class _PT:
             d.from_json(o)
             return d.to_bytes().hex().upper()
         except Exception as e:
-            return f"Error: {e}"
+            raise ValueError(f"Packet JSON encoding failed: {e}") from e
 
 
 class _FD:
@@ -233,7 +233,7 @@ class ExpansionHandle:
         不在标准 OneBot v11 action 范围内,可能因协议变更失效。
 
         Returns:
-            True 表示 send_packet 调用成功,False 表示调用失败。
+            True 表示 send_packet 调用成功,False 表示编码或调用失败。
         """
         # OidbSvc.0xfd8_1: req.body.remark = 新备注
         p = {
@@ -241,8 +241,8 @@ class ExpansionHandle:
             "4": {"1": target_uin, "5": {"1": remark}},
             "12": 1,
         }
-        data = _PT.j2h(_json.dumps(p, ensure_ascii=False))
         try:
+            data = _PT.j2h(_json.dumps(p, ensure_ascii=False))
             await client.api.call_action(
                 "send_packet",
                 cmd="OidbSvcTrpcTcp.0xfd8_1",
