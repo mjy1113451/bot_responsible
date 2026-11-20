@@ -19,7 +19,7 @@ from astrbot.api import logger
 
 # 插件版本的代码侧唯一来源，必须与 metadata.yaml 的 version 保持一致。
 # 升级时只改这里和 metadata.yaml 两处，避免日志/横幅等处出现版本号副本。
-PLUGIN_VERSION = "5.2.16"
+PLUGIN_VERSION = "5.2.17"
 
 # issue #81：私聊失败的好友关系特征。只认协议端 wording 里"明确判定为非好友"
 # 的表述，不收录"好友关系"这类宽泛说法——"好友关系异常"等其他故障会被误
@@ -2985,9 +2985,10 @@ class RelationshipManager(Star):
         # 日志，错误文本带好友关系特征的目标单独归类为「非好友/已失效」，
         # 不再与真实广播失败混在同一个"失败QQ号"列表里。
         not_friend_friends: List[str] = []
+        excluded_friend_ids = {sender_id, str(self_id).strip()}
         for f in friend_items:
             fid = str(f.get("user_id") or "").strip()
-            if not fid:
+            if not fid or fid in excluded_friend_ids:
                 continue
             sent = False
             last_res: Any = None
